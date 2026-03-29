@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root BTCPP_format="4" main_tree_to_execute="rmul_2025">
+  <BehaviorTree ID="check_game_start">
+    <Fallback>
+      <IsGameStatus max_remain_time="420"
+                    min_remain_time="0"
+                    expected_game_progress="4"
+                    key_port="{referee_data}"/>
+    </Fallback>
+  </BehaviorTree>
+
+  <BehaviorTree ID="rmul_2025">
+    <KeepRunningUntilFailure>
+      <ForceSuccess>
+        <ReactiveSequence>
+          <SubTree ID="check_game_start" referee_data="{referee_data}"/>
+          <ReactiveFallback>
+            <Sequence>
+              <LowHpLatched enter_hp="200"
+                            exit_hp="220"
+                            key_port="{referee_data}"/>
+              <PubNav2Goal goal="0;0;0"
+                           topic_name="goal_pose"
+                           republish_interval="0"/>
+            </Sequence>
+
+            <Sequence>
+              <IsTargetVisible target_topic="/auto_aim_target_pos" timeout="0.2"/>
+              <PublishCurrentPoseGoal topic_name="goal_pose"
+                                      map_frame="map"
+                                      robot_frame="base_link"/>
+              <PublishTwist v_x="0.0" v_y="0.0" v_yaw="0.0" topic_name="cmd_vel"/>
+            </Sequence>
+
+            <Sequence>
+              <Inverter>
+                <LowHpLatched enter_hp="200"
+                              exit_hp="220"
+                              key_port="{referee_data}"/>
+              </Inverter>
+              <IsStatusOK ammo_min="0"
+                          heat_max="350"
+                          hp_min="200"
+                          key_port="{referee_data}"/>
+              <PubNav2Goal goal="4.50;-2.10;0"
+                           topic_name="goal_pose"
+                           republish_interval="0"/>
+            </Sequence>
+          </ReactiveFallback>
+        </ReactiveSequence>
+      </ForceSuccess>
+    </KeepRunningUntilFailure>
+  </BehaviorTree>
+
+  <TreeNodesModel>
+    <Condition ID="IsGameStatus">
+      <input_port name="max_remain_time" default="420" type="int">Maximum remaining time (s)</input_port>
+      <input_port name="min_remain_time" default="0" type="int">Minimum remaining time (s)</input_port>
+      <input_port name="expected_game_progress" default="4" type="int">Expected game progress stage</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="IsStatusOK">
+      <input_port name="ammo_min" default="0" type="int">Lower then minimum ammo will return FAILURE</input_port>
+      <input_port name="heat_max" default="350" type="int">Maximum heat. NOTE: Sentry heat limit is 400</input_port>
+      <input_port name="hp_min" default="300" type="int">Minimum HP. NOTE: Sentry init/max HP is 400</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="LowHpLatched">
+      <input_port name="enter_hp" default="200" type="int">Enter return-home mode below this HP</input_port>
+      <input_port name="exit_hp" default="220" type="int">Exit return-home mode above this HP</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="IsTargetVisible">
+      <input_port name="target_topic" default="/auto_aim_target_pos" type="std::string">Target topic</input_port>
+      <input_port name="timeout" default="0.2" type="double">Seconds to consider target valid</input_port>
+    </Condition>
+    <Action ID="PubNav2Goal">
+      <input_port name="goal" default="0;0;0" type="std::string">Expected goal pose that send to nav2. Fill with format `x;y;yaw`</input_port>
+      <input_port name="topic_name" default="goal_pose" type="std::string">Topic name</input_port>
+      <input_port name="republish_interval" default="0.0" type="double">Republish interval in seconds (&lt;=0 means publish only when goal changes)</input_port>
+    </Action>
+    <Action ID="PublishCurrentPoseGoal">
+      <input_port name="topic_name" default="goal_pose" type="std::string">Goal topic</input_port>
+      <input_port name="map_frame" default="map" type="std::string">Map frame</input_port>
+      <input_port name="robot_frame" default="base_link" type="std::string">Robot frame</input_port>
+    </Action>
+    <Action ID="PublishTwist">
+      <input_port name="v_y" default="0.000000" type="double">Linear Y velocity (m/s)</input_port>
+      <input_port name="v_yaw" default="0.000000" type="double">Angular Z velocity (rad/s)</input_port>
+      <input_port name="v_x" default="0.000000" type="double">Linear X velocity (m/s)</input_port>
+      <input_port name="duration" type="std::chrono::milliseconds">Publish then sleep duration in milliseconds</input_port>
+      <input_port name="topic_name" default="cmd_vel" type="std::string">Topic name</input_port>
+    </Action>
+  </TreeNodesModel>
+</root>

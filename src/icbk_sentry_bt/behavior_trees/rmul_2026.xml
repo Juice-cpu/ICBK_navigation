@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root BTCPP_format="4" main_tree_to_execute="rmul_2025">
+  <!-- Main tree: rmul_2025 -->
+  <!-- Game start gate -->
+  <BehaviorTree ID="check_game_start">
+    <Fallback>
+      <IsGameStatus max_remain_time="420"
+                    min_remain_time="0"
+                    expected_game_progress="4"
+                    key_port="{referee_data}"/>
+    </Fallback>
+  </BehaviorTree>
+
+  <!-- Robot status check (fallback safety) -->
+  <BehaviorTree ID="check_robot_status">
+    <Fallback>
+      <IsStatusOK ammo_min="0"
+                  heat_max="350"
+                  hp_min="200"
+                  key_port="{referee_data}"/>
+      <ForceFailure>
+        <Fallback>
+          <IsRfidDetected friendly_supply_zone_exchange="false"
+                          friendly_supply_zone_non_exchange="true"
+                          center_gain_point="false"
+                          friendly_fortress_gain_point="false"
+                          key_port="{referee_data}"/>
+          <PubNav2Goal goal="0;0;0"
+                       topic_name="goal_pose"/>
+        </Fallback>
+      </ForceFailure>
+    </Fallback>
+  </BehaviorTree>
+
+  <!-- Core behavior tree -->
+  <BehaviorTree ID="rmul_2025">
+    <KeepRunningUntilFailure>
+      <ForceSuccess>
+        <ReactiveSequence>
+          <SubTree ID="check_game_start" referee_data="{referee_data}"/>
+          <ReactiveFallback>
+            <!-- hp < 200：低血量最高优先级，立即回家并抢占其它行为 -->
+            <Sequence>
+              <!-- HP below enter_hp triggers return-home; exit requires HP above exit_hp -->
+              <LowHpLatched enter_hp="200"
+                            exit_hp="220"
+                            key_port="{referee_data}"/>
+              <!-- Home goal (NavigateToPose) -->
+              <ReturnHome home_point="{home_point}"/>
+            </Sequence>
+
+            <ReactiveFallback>
+              <!-- 目标出现时优先进入攻击分支；巡逻节点内部也会主动让出导航 -->
+              <ReactiveSequence>
+                <IsTargetVisible target_topic="/auto_aim_target_pos" timeout="0.5"/>
+                <!-- Only cancel navigation when NOT in return-home mode -->
+                <Inverter>
+                  <LowHpLatched enter_hp="200"
+                                exit_hp="220"
+                                key_port="{referee_data}"/>
+                </Inverter>
+                <CancelNavigation/>
+              </ReactiveSequence>
+              <!-- hp >= 200：统一巡逻节点，内部闭环管理巡逻、目标让路与路线切换 -->
+              <Sequence>
+                <!-- Block patrol while in return-home mode -->
+                <Inverter>
+                  <LowHpLatched enter_hp="200"
+                                exit_hp="220"
+                                key_port="{referee_data}"/>
+                </Inverter>
+                <IsStatusOK ammo_min="0"
+                            heat_max="350"
+                            hp_min="200"
+                            key_port="{referee_data}"/>
+                <!-- Patrol uses a single fixed point for now -->
+                <PatrolBetweenPoints high_points="4.50;-2.10;0"
+                                     low_points="4.50;-2.10;0"
+                                     hp_switch_threshold="200"
+                                     hp_abort_threshold="200"
+                                     target_topic="/auto_aim_target_pos"
+                                     target_timeout="0.5"
+                                     key_port="{referee_data}"/>
+              </Sequence>
+            </ReactiveFallback>
+          </ReactiveFallback>
+        </ReactiveSequence>
+      </ForceSuccess>
+    </KeepRunningUntilFailure>
+  </BehaviorTree>
+
+  <!-- TreeNodesModel is for Groot editor -->
+  <TreeNodesModel>
+    <Condition ID="IsGameStatus">
+      <input_port name="max_remain_time" default="420" type="int">Maximum remaining time (s)</input_port>
+      <input_port name="min_remain_time" default="0" type="int">Minimum remaining time (s)</input_port>
+      <input_port name="expected_game_progress" default="4" type="int">Expected game progress stage</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="IsRfidDetected">
+      <input_port name="friendly_supply_zone_exchange" default="false" type="bool">Friendly supply zone exchange</input_port>
+      <input_port name="friendly_supply_zone_non_exchange" default="false" type="bool">Friendly supply zone non-exchange</input_port>
+      <input_port name="center_gain_point" default="false" type="bool">Center gain point</input_port>
+      <input_port name="friendly_fortress_gain_point" default="false" type="bool">Friendly fortress gain point</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="IsStatusOK">
+      <input_port name="ammo_min" default="0" type="int">Lower then minimum ammo will return FAILURE</input_port>
+      <input_port name="heat_max" default="350" type="int">Maximum heat. NOTE: Sentry heat limit is 400</input_port>
+      <input_port name="hp_min" default="300" type="int">Minimum HP. NOTE: Sentry init/max HP is 400</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="LowHpLatched">
+      <input_port name="enter_hp" default="200" type="int">Enter return-home mode below this HP</input_port>
+      <input_port name="exit_hp" default="220" type="int">Exit return-home mode above this HP</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="PubNav2Goal">
+      <input_port name="goal" default="0;0;0" type="geometry_msgs::msg::PoseStamped_&lt;std::allocator&lt;void&gt; &gt;">Expected goal pose that send to nav2. Fill with format `x;y;yaw`</input_port>
+      <input_port name="topic_name" default="__default__placeholder__" type="std::string">Topic name</input_port>
+    </Condition>
+    <Action ID="PatrolBetweenPoints">
+      <input_port name="high_points" type="std::string">High HP patrol route, split by | with x;y;yaw</input_port>
+      <input_port name="low_points" type="std::string">Mid HP patrol route, split by | with x;y;yaw</input_port>
+      <input_port name="hp_switch_threshold" default="300" type="int">HP threshold for high route</input_port>
+      <input_port name="hp_abort_threshold" default="200" type="int">HP threshold below which patrol yields</input_port>
+      <input_port name="target_topic" default="/auto_aim_target_pos" type="std::string">Target topic monitored inside patrol</input_port>
+      <input_port name="target_timeout" default="0.5" type="double">Target validity timeout inside patrol</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Action>
+    <Action ID="PublishSpinSpeed">
+      <input_port name="spin_speed" default="0.000000" type="double">Angular Z velocity (rad/s)</input_port>
+      <input_port name="duration" type="std::chrono::milliseconds">Publish then sleep duration in milliseconds</input_port>
+      <input_port name="topic_name" default="__default__placeholder__" type="std::string">Topic name</input_port>
+    </Action>
+    <Action ID="PublishTwist">
+      <input_port name="v_y" default="0.000000" type="double">Linear Y velocity (m/s)</input_port>
+      <input_port name="v_yaw" default="0.000000" type="double">Angular Z velocity (rad/s)</input_port>
+      <input_port name="v_x" default="0.000000" type="double">Linear X velocity (m/s)</input_port>
+      <input_port name="duration" type="std::chrono::milliseconds">Publish then sleep duration in milliseconds</input_port>
+      <input_port name="topic_name" default="__default__placeholder__" type="std::string">Topic name</input_port>
+    </Action>
+    <Action ID="CancelNavigation"/>
+    <Condition ID="IsTargetVisible">
+      <input_port name="target_topic" default="/armor_solver/target" type="std::string">Target topic</input_port>
+      <input_port name="timeout" default="1.0" type="double">Seconds to consider target valid</input_port>
+    </Condition>
+    <Condition ID="EnemyVisibleFromTopic">
+      <input_port name="target_topic" default="/armor_solver/target" type="std::string">Target topic</input_port>
+      <input_port name="timeout" default="1.0" type="double">Seconds to consider target valid</input_port>
+    </Condition>
+    <Action ID="ChaseTarget">
+      <input_port name="target_topic" default="/armor_solver/target" type="std::string">Target topic</input_port>
+      <input_port name="follow_distance" default="2.0" type="double">Follow distance behind target (m)</input_port>
+      <input_port name="prediction_horizon" default="0.2" type="double">Predict position by velocity * horizon (s)</input_port>
+      <input_port name="topic_name" default="goal_pose" type="std::string">Topic name for PoseStamped goal</input_port>
+    </Action>
+    <Action ID="ReturnHome">
+      <input_port name="home_point" type="geometry_msgs::msg::PoseStamped_&lt;std::allocator&lt;void&gt; &gt;">Home pose sent directly to NavigateToPose</input_port>
+    </Action>
+  </TreeNodesModel>
+
+</root>
