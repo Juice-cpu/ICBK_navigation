@@ -15,15 +15,29 @@
         <ReactiveSequence>
           <SubTree ID="check_game_start" referee_data="{referee_data}"/>
           <ReactiveFallback>
+            <!-- 第一优先级：低血或电控要求回家时，直接回默认 home 点。 -->
             <Sequence>
-              <LowHpLatched enter_hp="200"
-                            exit_hp="220"
-                            key_port="{referee_data}"/>
+              <Fallback>
+                <LowHpLatched enter_hp="150"
+                              exit_hp="170"
+                              key_port="{referee_data}"/>
+                <IsEcDecisionGoHome key_port="{referee_data}"/>
+              </Fallback>
               <PubNav2Goal goal="0;0;0"
                            topic_name="goal_pose"
-                           republish_interval="0"/>
+                           republish_interval="0.5"/>
             </Sequence>
 
+            <!-- 第二优先级：己方前哨站血量归零后，切换到登堡垒目标点。 -->
+            <Sequence>
+              <IsAllyOutpostDestroyed key_port="{referee_data}"/>
+              <PubNav2Goal goal="1.73;-0.36;0"
+                           topic_name="goal_pose"
+                           republish_interval="0.5"/>
+            </Sequence>
+
+            <!-- 第三优先级：视觉模式暂时停用，后续需要时再恢复。 -->
+            <!--
             <Sequence>
               <IsTargetVisible target_topic="/auto_aim_target_pos" timeout="0.2"/>
               <PublishCurrentPoseGoal topic_name="goal_pose"
@@ -31,20 +45,27 @@
                                       robot_frame="base_link"/>
               <PublishTwist v_x="0.0" v_y="0.0" v_yaw="0.0" topic_name="cmd_vel"/>
             </Sequence>
+            -->
 
+            <!-- 最后兜底：非低血状态下，按常规策略去默认巡逻/压制点。 -->
             <Sequence>
               <Inverter>
-                <LowHpLatched enter_hp="200"
-                              exit_hp="220"
+                <LowHpLatched enter_hp="150"
+                              exit_hp="170"
                               key_port="{referee_data}"/>
               </Inverter>
-              <IsStatusOK ammo_min="0"
-                          heat_max="350"
-                          hp_min="200"
-                          key_port="{referee_data}"/>
-              <PubNav2Goal goal="4.50;-2.10;0"
-                           topic_name="goal_pose"
-                           republish_interval="0"/>
+              <Fallback>
+                <IsStatusOK ammo_min="0"
+                            heat_max="350"
+                            hp_min="150"
+                            key_port="{referee_data}"/>
+                <IsEcDecisionGoOut key_port="{referee_data}"/>
+              </Fallback>
+              <PatrolBetweenPoints high_points="3.08;-0.43;0|3.92;-2.19;0"
+                                    low_points="3.08;-0.43;0|3.92;-2.19;0"
+                                    hp_abort_threshold="150"
+                                    topic_name="goal_pose"
+                                    key_port="{referee_data}"/>
             </Sequence>
           </ReactiveFallback>
         </ReactiveSequence>
@@ -74,10 +95,34 @@
       <input_port name="target_topic" default="/auto_aim_target_pos" type="std::string">Target topic</input_port>
       <input_port name="timeout" default="0.2" type="double">Seconds to consider target valid</input_port>
     </Condition>
+    <Condition ID="IsEcDecisionGoOut">
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="IsEcDecisionGoHome">
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
+    <Condition ID="IsAllyOutpostDestroyed">
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
+    </Condition>
     <Action ID="PubNav2Goal">
       <input_port name="goal" default="0;0;0" type="std::string">Expected goal pose that send to nav2. Fill with format `x;y;yaw`</input_port>
       <input_port name="topic_name" default="goal_pose" type="std::string">Topic name</input_port>
       <input_port name="republish_interval" default="0.0" type="double">Republish interval in seconds (&lt;=0 means publish only when goal changes)</input_port>
+    </Action>
+    <Action ID="PatrolBetweenPoints">
+      <input_port name="high_points" type="std::string">Patrol route points, split by | with x;y;yaw</input_port>
+      <input_port name="low_points" type="std::string">Fallback patrol route points, split by | with x;y;yaw</input_port>
+      <input_port name="hp_switch_threshold" default="300" type="int">HP threshold for switching to high route</input_port>
+      <input_port name="hp_abort_threshold" default="200" type="int">HP threshold below which patrol must yield</input_port>
+      <input_port name="target_topic" default="/auto_aim_target_pos" type="std::string">Target topic to monitor</input_port>
+      <input_port name="target_timeout" default="0.5" type="double">Seconds to consider target valid</input_port>
+      <input_port name="topic_name" default="goal_pose" type="std::string">Goal topic name</input_port>
+      <input_port name="position_tolerance" default="0.25" type="double">Goal position tolerance in meters</input_port>
+      <input_port name="yaw_tolerance" default="0.35" type="double">Goal yaw tolerance in radians</input_port>
+      <input_port name="republish_interval" default="0.5" type="double">Goal republish interval in seconds</input_port>
+      <input_port name="map_frame" default="map" type="std::string">Global frame</input_port>
+      <input_port name="robot_frame" default="base_link" type="std::string">Robot frame</input_port>
+      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
     </Action>
     <Action ID="PublishCurrentPoseGoal">
       <input_port name="topic_name" default="goal_pose" type="std::string">Goal topic</input_port>

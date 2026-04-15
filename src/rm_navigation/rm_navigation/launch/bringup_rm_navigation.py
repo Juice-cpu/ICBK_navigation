@@ -7,7 +7,7 @@ from launch.actions import (DeclareLaunchArgument, GroupAction,
                             IncludeLaunchDescription, SetEnvironmentVariable)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.actions import PushRosNamespace
 from nav2_common.launch import RewrittenYaml
@@ -124,6 +124,31 @@ def generate_launch_description():
                               'use_composition': use_composition,
                               'use_respawn': use_respawn,
                               'container_name': 'nav2_container'}.items()),
+
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(os.path.join(launch_dir, 'map_server_launch.py')),
+            condition=IfCondition(PythonExpression(['not ', LaunchConfiguration('use_slam')])),
+            launch_arguments={'namespace': namespace,
+                              'map': map_yaml_file,
+                              'use_sim_time': use_sim_time,
+                              'autostart': autostart,
+                              'params_file': params_file,
+                              'use_composition': use_composition,
+                              'use_respawn': use_respawn,
+                              'container_name': 'nav2_container',
+                              'log_level': log_level}.items()),
+
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(os.path.join(launch_dir, 'localization_amcl_launch.py')),
+            condition=IfCondition(PythonExpression(['not ', LaunchConfiguration('use_slam')])),
+            launch_arguments={'namespace': namespace,
+                              'use_sim_time': use_sim_time,
+                              'autostart': autostart,
+                              'params_file': params_file,
+                              'use_composition': use_composition,
+                              'use_respawn': use_respawn,
+                              'container_name': 'nav2_container',
+                              'log_level': log_level}.items()),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(launch_dir, 'rviz_launch.py')),

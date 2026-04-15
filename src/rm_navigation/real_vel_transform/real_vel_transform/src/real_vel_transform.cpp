@@ -1,8 +1,8 @@
 #include "real_vel_transform/real_vel_transform.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <memory>
@@ -18,17 +18,16 @@
 namespace real_vel_transform
 {
 RealVelTransform::RealVelTransform(const rclcpp::NodeOptions & options)
-: Node("real_vel_transform", options),
-  serial_port_("/dev/stm32_robot_base", 115200, serial::Timeout::simpleTimeout(1000))
+: Node("real_vel_transform", options)
 {
   RCLCPP_INFO(get_logger(), "Start RealVelTransform!");
-  latest_hp_ = 0;
-  posture_mode_ = 1;
-  has_target_msg_ = false;
+  home_arrived_flag_ = 0;
   has_cmd_vel_ = false;
   serial_watchdog_active_ = false;
   serial_watchdog_timeout_sec_ = 0.3;
   last_cmd_vel_time_ = this->get_clock()->now();
+  current_angle_ = 0.0;
+  base_link_angle_ = 0.0;
 
   this->declare_parameter<float>("spin_speed", 0.0);
   this->get_parameter("spin_speed", spin_speed_);
@@ -44,16 +43,15 @@ RealVelTransform::RealVelTransform(const rclcpp::NodeOptions & options)
 
   cmd_vel_chassis_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
     AFTER_TF_CMD_VEL, rclcpp::QoS(rclcpp::KeepLast(1)));
+  stm32_tx_frame_pub_ = this->create_publisher<std_msgs::msg::String>(
+    STM32_TX_FRAME_TOPIC, rclcpp::QoS(rclcpp::KeepLast(10)));
 
   local_pose_sub_ = this->create_subscription<nav_msgs::msg::Path>(
     TRAJECTORY_TOPIC, 1, std::bind(&RealVelTransform::localPoseCallback, this, std::placeholders::_1));
 
-  hp_sub_ = this->create_subscription<std_msgs::msg::UInt16>(
-    SENTRY_HP_TOPIC, 10, std::bind(&RealVelTransform::hpCallback, this, std::placeholders::_1));
-
-  target_sub_ = this->create_subscription<std_msgs::msg::String>(
-    TARGET_TOPIC, rclcpp::SensorDataQoS(),
-    std::bind(&RealVelTransform::targetCallback, this, std::placeholders::_1));
+  home_arrived_sub_ = this->create_subscription<std_msgs::msg::UInt8>(
+    HOME_ARRIVED_TOPIC, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+    std::bind(&RealVelTransform::homeArrivedCallback, this, std::placeholders::_1));
 
   tf_timer_ = this->create_wall_timer(
     std::chrono::milliseconds(1000 / TF_PUBLISH_FREQUENCY),
@@ -67,14 +65,14 @@ RealVelTransform::RealVelTransform(const rclcpp::NodeOptions & options)
 void RealVelTransform::localPoseCallback(const nav_msgs::msg::Path::SharedPtr msg)
 {
   if (!msg || msg->poses.empty()) {
-    RCLCPP_WARN(get_logger(), "Received empty or invalid PoseArray message");
+    RCLCPP_WARN(get_logger(), "Received empty or invalid local plan");
     return;
   }
 
-  size_t index = std::min(msg->poses.size() / 4, msg->poses.size() - 1);
+  const size_t index = std::min(msg->poses.size() / 4, msg->poses.size() - 1);
   const geometry_msgs::msg::Pose & selected_pose = msg->poses[index].pose;
 
-  double teb_angle = tf2::getYaw(selected_pose.orientation);
+  const double teb_angle = tf2::getYaw(selected_pose.orientation);
   current_angle_ = teb_angle - base_link_angle_;
 }
 
@@ -89,7 +87,7 @@ void RealVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
     transform_stamped = tf2_buffer_->lookupTransform("odom", "base_link", tf2::TimePointZero);
     base_link_angle_ = tf2::getYaw(transform_stamped.transform.rotation);
 
-    double angle_diff = -current_angle_;
+    const double angle_diff = -current_angle_;
 
     geometry_msgs::msg::Twist aft_tf_vel;
     aft_tf_vel.angular.z = (msg->angular.z != 0.0) ? spin_speed_ : 0.0;
@@ -123,24 +121,19 @@ void RealVelTransform::serialWatchdogCallback()
   if (!serial_watchdog_active_) {
     RCLCPP_WARN(
       get_logger(),
-      "Serial watchdog timeout: cmd_vel stale for %.3f s (> %.3f s), forcing stop frame",
+      "STM32 watchdog timeout: cmd_vel stale for %.3f s (> %.3f s), forcing stop frame",
       age, serial_watchdog_timeout_sec_);
   }
   serial_watchdog_active_ = true;
 }
 
-void RealVelTransform::hpCallback(const std_msgs::msg::UInt16::SharedPtr msg)
+void RealVelTransform::homeArrivedCallback(const std_msgs::msg::UInt8::SharedPtr msg)
 {
-  latest_hp_ = msg->data;
-}
-
-void RealVelTransform::targetCallback(const std_msgs::msg::String::SharedPtr msg)
-{
-  const char * raw = msg->data.c_str();
-  char * end = nullptr;
-  const double target_flag = std::strtod(raw, &end);
-  has_target_msg_ = (end != raw) && (target_flag > 0.5);
-
+  const uint8_t flag = msg->data > 0 ? 1 : 0;
+  if (home_arrived_flag_ == flag) {
+    return;
+  }
+  home_arrived_flag_ = flag;
   if (has_cmd_vel_) {
     sendVelocityToController(last_controller_cmd_vel_);
   }
@@ -148,35 +141,22 @@ void RealVelTransform::targetCallback(const std_msgs::msg::String::SharedPtr msg
 
 void RealVelTransform::sendVelocityToController(const geometry_msgs::msg::Twist & msg)
 {
-  try {
-    if (latest_hp_ < kHpEscapeThreshold) {
-      posture_mode_ = 2;
-    } else if (latest_hp_ < kHpThreshold) {
-      posture_mode_ = 3;
-    } else if (has_target_msg_) {
-      posture_mode_ = 1;
-    } else {
-      posture_mode_ = 3;
-    }
+  std::stringstream ss;
+  ss << "￥"
+     << std::fixed << std::setprecision(5)
+     << std::setw(8) << msg.linear.x
+     << std::setw(8) << msg.linear.y
+     << std::setw(8) << msg.angular.z
+     << static_cast<unsigned>(home_arrived_flag_)
+     << "V";
 
-    std::stringstream ss;
-    ss << "$"
-       << std::fixed << std::setprecision(5)
-       << std::setw(8) << msg.linear.x
-       << std::setw(8) << msg.linear.y
-       << std::setw(8) << msg.angular.z
-       << posture_mode_
-       << "V";
-    std::string data = ss.str();
-    RCLCPP_INFO(get_logger(), "Sending to STM32: %ld", data.size());
-    RCLCPP_INFO(get_logger(), "Sending to STM32: %s", data.c_str());
-    RCLCPP_INFO(get_logger(), "Latest HP: %d", latest_hp_);
-    RCLCPP_INFO(get_logger(), "Posture Mode: %d", posture_mode_);
+  std_msgs::msg::String frame_msg;
+  frame_msg.data = ss.str();
+  stm32_tx_frame_pub_->publish(frame_msg);
 
-    serial_port_.write(data);
-  } catch (const serial::IOException & e) {
-    RCLCPP_ERROR(get_logger(), "Serial communication error: %s", e.what());
-  }
+  RCLCPP_INFO(get_logger(), "Publishing STM32 frame: %ld", frame_msg.data.size());
+  RCLCPP_INFO(get_logger(), "Publishing STM32 frame: %s", frame_msg.data.c_str());
+  RCLCPP_INFO(get_logger(), "Home Arrived Flag: %u", static_cast<unsigned>(home_arrived_flag_));
 }
 
 void RealVelTransform::publishTransform()
@@ -201,14 +181,6 @@ void RealVelTransform::publishTransform()
 }
 
 }  // namespace real_vel_transform
-
-int main(int argc, char ** argv)
-{
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<real_vel_transform::RealVelTransform>(rclcpp::NodeOptions()));
-  rclcpp::shutdown();
-  return 0;
-}
 
 #include "rclcpp_components/register_node_macro.hpp"
 

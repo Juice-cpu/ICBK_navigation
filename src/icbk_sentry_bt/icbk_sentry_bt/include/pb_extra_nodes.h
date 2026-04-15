@@ -15,13 +15,14 @@
 
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <map>
 #include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
 
+// 行为树共享缓存：裁判系统数据源与目标检测缓存都放在这里集中管理。
+// Shared BT cache for referee data and the latest visual target.
 inline SentryRefereeReceiver* g_referee_source = nullptr;
 inline rclcpp::Node::SharedPtr g_target_node = nullptr;
 inline rclcpp::Subscription<rm_interfaces::msg::Target>::SharedPtr g_target_sub = nullptr;
@@ -67,6 +68,7 @@ inline SentryRefereeReceiver* resolve_referee_from_port(
 inline void ensureTargetSubscription(const std::string& topic)
 {
     if (!g_target_node) {
+        // 为行为树内部的目标缓存创建独立节点，避免和主节点回调混用。
         g_target_node = make_isolated_node("bt_target_cache");
     }
     if (g_target_topic != topic || !g_target_sub) {
@@ -163,6 +165,7 @@ public:
         const int enter_hp = getInput<int>("enter_hp").value();
         const int exit_hp = getInput<int>("exit_hp").value();
 
+        // 用滞回避免血量在阈值边缘来回抖动，导致行为树频繁切分支。
         if (!latched_ && data.sentry_hp < enter_hp) {
             latched_ = true;
         } else if (latched_ && data.sentry_hp > exit_hp) {
@@ -179,6 +182,84 @@ public:
 
 private:
     inline static bool latched_ = false;
+};
+
+class IsAllyOutpostDestroyed : public BT::ConditionNode {
+public:
+    IsAllyOutpostDestroyed(const std::string& name, const BT::NodeConfiguration& config)
+        : BT::ConditionNode(name, config) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return {
+            BT::InputPort<SentryRefereeReceiver*>("key_port")
+        };
+    }
+
+    BT::NodeStatus tick() override
+    {
+        auto* ref_ptr = resolve_referee_from_port(*this);
+        const auto data = ref_ptr->getLatestData();
+        // 只有己方前哨站血量严格等于 0，才触发登堡垒分支。
+        return (data.ally_outpost_hp == 0) ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+    }
+
+    static void resetCache()
+    {
+        // 无状态节点，保留统一清理入口。
+    }
+};
+
+class IsEcDecisionGoOut : public BT::ConditionNode {
+public:
+    IsEcDecisionGoOut(const std::string& name, const BT::NodeConfiguration& config)
+        : BT::ConditionNode(name, config) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return {
+            BT::InputPort<SentryRefereeReceiver*>("key_port")
+        };
+    }
+
+    BT::NodeStatus tick() override
+    {
+        auto* ref_ptr = resolve_referee_from_port(*this);
+        const auto data = ref_ptr->getLatestData();
+        // 电控标志只有值等于 1 才视为“允许出家”。
+        return (data.ec_leave_flag == 1) ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+    }
+
+    static void resetCache()
+    {
+        // 无状态节点，保留统一清理入口。
+    }
+};
+
+class IsEcDecisionGoHome : public BT::ConditionNode {
+public:
+    IsEcDecisionGoHome(const std::string& name, const BT::NodeConfiguration& config)
+        : BT::ConditionNode(name, config) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return {
+            BT::InputPort<SentryRefereeReceiver*>("key_port")
+        };
+    }
+
+    BT::NodeStatus tick() override
+    {
+        auto* ref_ptr = resolve_referee_from_port(*this);
+        const auto data = ref_ptr->getLatestData();
+        // 电控标志只有值等于 1 才视为“要求回家”。
+        return (data.ec_home_flag == 1) ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+    }
+
+    static void resetCache()
+    {
+        // 无状态节点，保留统一清理入口。
+    }
 };
 
 class IsRfidDetected : public BT::ConditionNode {
@@ -218,6 +299,7 @@ public:
 
     BT::NodeStatus tick() override
     {
+        // This node consumes a string-encoded visibility flag topic rather than rm_interfaces::msg::Target.
         const std::string topic = getInput<std::string>("target_topic").value();
         const double timeout = getInput<double>("timeout").value();
 
@@ -228,6 +310,7 @@ public:
             topic_ = topic;
             has_msg_ = false;
             last_flag_ = false;
+            // 这里读取的是字符串话题，约定解析后大于 0.5 视为“有目标”。
             sub_ = node_->create_subscription<std_msgs::msg::String>(
                 topic, rclcpp::SensorDataQoS(),
                 [](const std_msgs::msg::String::SharedPtr msg) {
@@ -330,10 +413,12 @@ public:
             return BT::NodeStatus::FAILURE;
         }
 
+        // Build a follow goal from the latest cached target state.
         const auto& pos = g_last_target.position;
         const auto& vel = g_last_target.velocity;
         const double yaw = g_last_target.yaw;
 
+        // 先根据速度做一小段前向预测，再回退到目标后方形成跟随点。
         const double px = pos.x + vel.x * prediction_horizon;
         const double py = pos.y + vel.y * prediction_horizon;
         const double pz = pos.z + vel.z * prediction_horizon;
@@ -359,6 +444,7 @@ public:
             return BT::NodeStatus::FAILURE;
         }
 
+        // Reuse one publisher per output topic across BT ticks.
         static std::map<std::string, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> pubs;
         if (!pubs.count(topic_name)) {
             pubs[topic_name] = node_->create_publisher<geometry_msgs::msg::PoseStamped>(topic_name, rclcpp::QoS(10));
@@ -667,6 +753,7 @@ inline std::shared_ptr<tf2_ros::TransformListener> ChaseTarget::tf_listener_ = n
 
 inline void cleanupPbExtraNodeResources()
 {
+    // 退出前释放行为树内部创建的辅助节点，避免持有悬挂 ROS 资源。
     g_target_sub.reset();
     g_target_node.reset();
     g_target_topic.clear();
@@ -677,6 +764,9 @@ inline void cleanupPbExtraNodeResources()
     PubNav2Goal::cleanupSharedResources();
     PublishCurrentPoseGoal::cleanupSharedResources();
     IsTargetVisible::resetCache();
+    IsAllyOutpostDestroyed::resetCache();
+    IsEcDecisionGoOut::resetCache();
+    IsEcDecisionGoHome::resetCache();
     LowHpLatched::reset();
 }
 

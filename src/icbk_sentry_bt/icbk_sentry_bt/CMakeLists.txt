@@ -13,13 +13,16 @@ find_package(ament_index_cpp REQUIRED)
 find_package(behaviortree_cpp_v3 REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav2_msgs REQUIRED)
 find_package(rm_interfaces REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 
 add_executable(
   behavior_tree_main
   src/behavior_tree_main.cpp
+  src/patrol_between_points.cpp
   src/referee_receiver.cpp
 )
 
@@ -33,9 +36,17 @@ ament_target_dependencies(behavior_tree_main
   "behaviortree_cpp_v3"
   "std_msgs"
   "geometry_msgs"
+  "nav2_msgs"
   "rm_interfaces"
+  "rclcpp_action"
   "tf2_ros"
   "tf2_geometry_msgs")
+
+find_library(LIBSERIAL_LIBRARY serial)
+if(NOT LIBSERIAL_LIBRARY)
+  set(LIBSERIAL_LIBRARY /usr/lib/x86_64-linux-gnu/libserial.so)
+endif()
+target_link_libraries(behavior_tree_main ${LIBSERIAL_LIBRARY})
 
 target_link_libraries(behavior_tree_main /usr/lib/x86_64-linux-gnu/libserial.so)
 

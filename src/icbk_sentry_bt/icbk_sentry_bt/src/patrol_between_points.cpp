@@ -1,10 +1,13 @@
 #include "patrol_between_points.h"
 
+#include "tf2/LinearMath/Matrix3x3.h"
+#include "tf2/LinearMath/Quaternion.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+
 #include <chrono>
 #include <cmath>
-#include <future>
-#include <sstream>
 #include <cstdlib>
+#include <sstream>
 #include <utility>
 
 using namespace std::chrono_literals;
@@ -21,18 +24,26 @@ PatrolBetweenPoints::PatrolBetweenPoints(const std::string& name, const BT::Node
       route_index_(0),
       using_high_route_(false),
       ref_ptr_(nullptr),
+      goal_topic_("goal_pose"),
+      map_frame_("map"),
+      robot_frame_("base_link"),
       hp_switch_threshold_(300),
       hp_abort_threshold_(200),
       target_timeout_(0.5),
+      position_tolerance_(0.25),
+      yaw_tolerance_(0.35),
+      republish_interval_(0.5),
       has_target_(false),
       target_active_(false),
-      last_target_time_ns_(0) {
+      last_target_time_ns_(0),
+      has_current_goal_(false)
+{
     if (!node_) {
         rclcpp::NodeOptions options;
         options.use_global_arguments(false);
         node_ = rclcpp::Node::make_shared("patrol_between_points_node", options);
-        navigation_client_ = rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
-            node_, "navigate_to_pose");
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     }
 
     if (!executor_) {
@@ -47,7 +58,8 @@ PatrolBetweenPoints::PatrolBetweenPoints(const std::string& name, const BT::Node
     }
 }
 
-BT::PortsList PatrolBetweenPoints::providedPorts() {
+BT::PortsList PatrolBetweenPoints::providedPorts()
+{
     return {
         BT::InputPort<std::string>("high_points", "", "High HP patrol points, split by | with x;y;yaw"),
         BT::InputPort<std::string>("low_points", "", "Mid HP patrol points, split by | with x;y;yaw"),
@@ -55,15 +67,23 @@ BT::PortsList PatrolBetweenPoints::providedPorts() {
         BT::InputPort<int>("hp_abort_threshold", 200, "HP threshold below which patrol must yield"),
         BT::InputPort<std::string>("target_topic", "/auto_aim_target_pos", "Target topic to monitor"),
         BT::InputPort<double>("target_timeout", 0.5, "Seconds to consider target valid"),
+        BT::InputPort<std::string>("topic_name", "goal_pose", "Goal topic to publish"),
+        BT::InputPort<double>("position_tolerance", 0.25, "Goal position tolerance in meters"),
+        BT::InputPort<double>("yaw_tolerance", 0.35, "Goal yaw tolerance in radians"),
+        BT::InputPort<double>("republish_interval", 0.5, "Goal republish interval in seconds"),
+        BT::InputPort<std::string>("map_frame", "map", "Global frame"),
+        BT::InputPort<std::string>("robot_frame", "base_link", "Robot base frame"),
         BT::InputPort<SentryRefereeReceiver*>("key_port")
     };
 }
 
-rclcpp::Node::SharedPtr PatrolBetweenPoints::shared_node() {
+rclcpp::Node::SharedPtr PatrolBetweenPoints::shared_node()
+{
     return node_;
 }
 
-void PatrolBetweenPoints::cleanupSharedResources() {
+void PatrolBetweenPoints::cleanupSharedResources()
+{
     executor_running_ = false;
     if (executor_) {
         executor_->cancel();
@@ -71,61 +91,21 @@ void PatrolBetweenPoints::cleanupSharedResources() {
     if (spin_thread_.joinable()) {
         spin_thread_.join();
     }
+    publishers_.clear();
     executor_.reset();
-    navigation_client_.reset();
+    tf_listener_.reset();
+    tf_buffer_.reset();
     node_.reset();
 }
 
-bool PatrolBetweenPoints::ensureActionServer() {
-    if (!navigation_client_) {
-        return false;
-    }
-    if (!navigation_client_->wait_for_action_server(1s)) {
-        RCLCPP_WARN(node_->get_logger(), "PatrolBetweenPoints: waiting for NavigateToPose action server");
-        return false;
-    }
-    return true;
+bool PatrolBetweenPoints::ensurePoseAvailable()
+{
+    geometry_msgs::msg::PoseStamped pose;
+    return currentRobotPose(pose);
 }
 
-bool PatrolBetweenPoints::cancelExistingGoals() {
-    if (!navigation_client_) {
-        return false;
-    }
-    auto cancel_future = navigation_client_->async_cancel_all_goals();
-    const auto status = cancel_future.wait_for(1s);
-    if (status != std::future_status::ready) {
-        RCLCPP_WARN(node_->get_logger(), "PatrolBetweenPoints: timeout while canceling existing goals");
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    navigation_goal_handle_.reset();
-    return true;
-}
-
-void PatrolBetweenPoints::cancelCurrentGoal(const char* reason) {
-    rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr goal_handle;
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (!navigation_client_ || !navigation_goal_handle_) {
-            return;
-        }
-        goal_handle = navigation_goal_handle_;
-        navigation_goal_handle_.reset();
-    }
-
-    RCLCPP_INFO(node_->get_logger(),
-                "PatrolBetweenPoints: cancelCurrentGoal reason=%s",
-                reason ? reason : "unknown");
-    try {
-        navigation_client_->async_cancel_goal(goal_handle);
-    } catch (const rclcpp_action::exceptions::UnknownGoalHandleError& ex) {
-        RCLCPP_WARN(node_->get_logger(),
-                    "PatrolBetweenPoints: cancel ignored for unknown goal handle: %s",
-                    ex.what());
-    }
-}
-
-bool PatrolBetweenPoints::parseGoalToken(const std::string& token, geometry_msgs::msg::PoseStamped& pose) {
+bool PatrolBetweenPoints::parseGoalToken(const std::string& token, geometry_msgs::msg::PoseStamped& pose)
+{
     std::stringstream ss(token);
     std::string item;
     std::vector<std::string> tokens;
@@ -155,7 +135,8 @@ bool PatrolBetweenPoints::parseGoalToken(const std::string& token, geometry_msgs
     return true;
 }
 
-bool PatrolBetweenPoints::parseRoute(const std::string& route_str, std::vector<geometry_msgs::msg::PoseStamped>& route) {
+bool PatrolBetweenPoints::parseRoute(const std::string& route_str, std::vector<geometry_msgs::msg::PoseStamped>& route)
+{
     route.clear();
     std::stringstream ss(route_str);
     std::string token;
@@ -172,7 +153,8 @@ bool PatrolBetweenPoints::parseRoute(const std::string& route_str, std::vector<g
     return !route.empty();
 }
 
-bool PatrolBetweenPoints::loadInputs() {
+bool PatrolBetweenPoints::loadInputs()
+{
     try {
         auto ref = getInput<SentryRefereeReceiver*>("key_port");
         if (!ref) {
@@ -185,13 +167,20 @@ bool PatrolBetweenPoints::loadInputs() {
         hp_abort_threshold_ = getInput<int>("hp_abort_threshold").value();
         target_topic_ = getInput<std::string>("target_topic").value();
         target_timeout_ = getInput<double>("target_timeout").value();
+        goal_topic_ = getInput<std::string>("topic_name").value();
+        position_tolerance_ = getInput<double>("position_tolerance").value();
+        yaw_tolerance_ = getInput<double>("yaw_tolerance").value();
+        republish_interval_ = getInput<double>("republish_interval").value();
+        map_frame_ = getInput<std::string>("map_frame").value();
+        robot_frame_ = getInput<std::string>("robot_frame").value();
         return true;
     } catch (const std::exception&) {
         return false;
     }
 }
 
-bool PatrolBetweenPoints::routeShouldBeHigh() const {
+bool PatrolBetweenPoints::routeShouldBeHigh() const
+{
     if (!ref_ptr_) {
         return false;
     }
@@ -199,7 +188,8 @@ bool PatrolBetweenPoints::routeShouldBeHigh() const {
     return data.sentry_hp >= hp_switch_threshold_;
 }
 
-bool PatrolBetweenPoints::refreshRoute(bool force_reset) {
+bool PatrolBetweenPoints::refreshRoute(bool force_reset)
+{
     const bool should_use_high = routeShouldBeHigh();
     if (!force_reset && should_use_high == using_high_route_) {
         return true;
@@ -227,7 +217,8 @@ bool PatrolBetweenPoints::refreshRoute(bool force_reset) {
     return true;
 }
 
-void PatrolBetweenPoints::updateRouteForCurrentHp() {
+void PatrolBetweenPoints::updateRouteForCurrentHp()
+{
     const bool should_use_high = routeShouldBeHigh();
     if (should_use_high == using_high_route_) {
         return;
@@ -236,14 +227,13 @@ void PatrolBetweenPoints::updateRouteForCurrentHp() {
         yield_requested_ = true;
         navigation_done_ = true;
         navigation_result_ = BT::NodeStatus::FAILURE;
-        cancelCurrentGoal("route_switch");
         return;
     }
     restart_requested_ = true;
-    cancelCurrentGoal("route_switch");
 }
 
-bool PatrolBetweenPoints::shouldYieldForHp() const {
+bool PatrolBetweenPoints::shouldYieldForHp() const
+{
     if (!ref_ptr_) {
         return true;
     }
@@ -256,7 +246,8 @@ bool PatrolBetweenPoints::shouldYieldForHp() const {
     return false;
 }
 
-bool PatrolBetweenPoints::targetCurrentlyVisible() const {
+bool PatrolBetweenPoints::targetCurrentlyVisible() const
+{
     if (!has_target_) {
         return false;
     }
@@ -267,22 +258,25 @@ bool PatrolBetweenPoints::targetCurrentlyVisible() const {
     const auto age = (node_->now() - rclcpp::Time(last_ns, node_->get_clock()->get_clock_type())).seconds();
     return age <= target_timeout_;
 }
-/// @brief 
-void PatrolBetweenPoints::startMonitorLoop() {
+
+void PatrolBetweenPoints::startMonitorLoop()
+{
     stopMonitorLoop();
     stop_monitor_ = false;
     patrol_active_ = true;
     monitor_thread_ = std::thread([this]() { monitorLoop(); });
 }
 
-void PatrolBetweenPoints::stopMonitorLoop() {
+void PatrolBetweenPoints::stopMonitorLoop()
+{
     stop_monitor_ = true;
     if (monitor_thread_.joinable()) {
         monitor_thread_.join();
     }
 }
 
-void PatrolBetweenPoints::monitorLoop() {
+void PatrolBetweenPoints::monitorLoop()
+{
     while (!stop_monitor_) {
         if (!patrol_active_) {
             std::this_thread::sleep_for(20ms);
@@ -300,7 +294,6 @@ void PatrolBetweenPoints::monitorLoop() {
             if (!paused_for_target_) {
                 RCLCPP_INFO(node_->get_logger(), "PatrolBetweenPoints: target visible, pausing patrol");
                 paused_for_target_ = true;
-                cancelCurrentGoal("target_visible");
             }
             std::this_thread::sleep_for(20ms);
             continue;
@@ -316,10 +309,8 @@ void PatrolBetweenPoints::monitorLoop() {
                 yield_requested_ = true;
                 navigation_done_ = true;
                 navigation_result_ = BT::NodeStatus::FAILURE;
-                cancelCurrentGoal("route_refresh_failed");
                 break;
             }
-            // Resume patrol immediately from monitor loop (not relying on BT tick or action callbacks).
             sendNextGoal();
         }
 
@@ -328,7 +319,98 @@ void PatrolBetweenPoints::monitorLoop() {
     }
 }
 
-BT::NodeStatus PatrolBetweenPoints::sendNextGoal() {
+bool PatrolBetweenPoints::publishGoal(const geometry_msgs::msg::PoseStamped& pose, bool force_log)
+{
+    if (!publishers_.count(goal_topic_)) {
+        auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+        publishers_[goal_topic_] = node_->create_publisher<geometry_msgs::msg::PoseStamped>(goal_topic_, qos);
+    }
+
+    auto msg = pose;
+    msg.header.stamp = node_->now();
+    msg.header.frame_id = map_frame_;
+    publishers_[goal_topic_]->publish(msg);
+    last_goal_publish_time_ = msg.header.stamp;
+
+    if (force_log) {
+        RCLCPP_INFO(node_->get_logger(), "PatrolBetweenPoints: published patrol goal on %s", goal_topic_.c_str());
+    }
+    return true;
+}
+
+bool PatrolBetweenPoints::currentRobotPose(geometry_msgs::msg::PoseStamped& pose) const
+{
+    if (!tf_buffer_) {
+        return false;
+    }
+
+    geometry_msgs::msg::TransformStamped transform;
+    try {
+        transform = tf_buffer_->lookupTransform(
+            map_frame_, robot_frame_, tf2::TimePointZero, tf2::durationFromSec(0.05));
+    } catch (const tf2::TransformException& ex) {
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 1000,
+            "PatrolBetweenPoints: TF %s -> %s failed: %s",
+            map_frame_.c_str(), robot_frame_.c_str(), ex.what());
+        return false;
+    }
+
+    pose.header = transform.header;
+    pose.header.frame_id = map_frame_;
+    pose.pose.position.x = transform.transform.translation.x;
+    pose.pose.position.y = transform.transform.translation.y;
+    pose.pose.position.z = transform.transform.translation.z;
+    pose.pose.orientation = transform.transform.rotation;
+    return true;
+}
+
+double PatrolBetweenPoints::normalizeAngle(double angle)
+{
+    while (angle > M_PI) {
+        angle -= 2.0 * M_PI;
+    }
+    while (angle < -M_PI) {
+        angle += 2.0 * M_PI;
+    }
+    return angle;
+}
+
+bool PatrolBetweenPoints::currentGoalReached() const
+{
+    if (!has_current_goal_) {
+        return false;
+    }
+
+    geometry_msgs::msg::PoseStamped robot_pose;
+    if (!currentRobotPose(robot_pose)) {
+        return false;
+    }
+
+    const double dx = current_goal_.pose.position.x - robot_pose.pose.position.x;
+    const double dy = current_goal_.pose.position.y - robot_pose.pose.position.y;
+    const double distance = std::hypot(dx, dy);
+
+    tf2::Quaternion goal_q;
+    tf2::fromMsg(current_goal_.pose.orientation, goal_q);
+    double goal_roll = 0.0;
+    double goal_pitch = 0.0;
+    double goal_yaw = 0.0;
+    tf2::Matrix3x3(goal_q).getRPY(goal_roll, goal_pitch, goal_yaw);
+
+    tf2::Quaternion robot_q;
+    tf2::fromMsg(robot_pose.pose.orientation, robot_q);
+    double robot_roll = 0.0;
+    double robot_pitch = 0.0;
+    double robot_yaw = 0.0;
+    tf2::Matrix3x3(robot_q).getRPY(robot_roll, robot_pitch, robot_yaw);
+
+    const double yaw_error = std::fabs(normalizeAngle(goal_yaw - robot_yaw));
+    return distance <= position_tolerance_ && yaw_error <= yaw_tolerance_;
+}
+
+BT::NodeStatus PatrolBetweenPoints::sendNextGoal()
+{
     geometry_msgs::msg::PoseStamped next_pose;
     std::size_t current_index = 0;
     {
@@ -344,72 +426,29 @@ BT::NodeStatus PatrolBetweenPoints::sendNextGoal() {
         route_index_ = (route_index_ + 1) % active_route_.size();
         navigation_done_ = false;
         navigation_result_ = BT::NodeStatus::RUNNING;
-        navigation_goal_handle_.reset();
+        current_goal_ = next_pose;
+        has_current_goal_ = true;
     }
 
-    auto goal_msg = nav2_msgs::action::NavigateToPose::Goal();
-    goal_msg.pose = next_pose;
-
-    auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-    send_goal_options.goal_response_callback =
-        [this](std::shared_ptr<rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>> handle) {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            if (!handle) {
-                RCLCPP_ERROR(node_->get_logger(), "PatrolBetweenPoints: goal rejected");
-                navigation_result_ = BT::NodeStatus::FAILURE;
-                navigation_done_ = true;
-                return;
-            }
-            navigation_goal_handle_ = handle;
-        };
-    send_goal_options.result_callback =
-        [this](const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::WrappedResult& result) {
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                navigation_goal_handle_.reset();
-            }
-            if (!patrol_active_) {
-                return;
-            }
-
-            if (yield_requested_) {
-                navigation_result_ = BT::NodeStatus::FAILURE;
-                navigation_done_ = true;
-                return;
-            }
-
-            if (paused_for_target_) {
-                return;
-            }
-
-            if (restart_requested_) {
-                restart_requested_ = false;
-                sendNextGoal();
-                return;
-            }
-
-            if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
-                sendNextGoal();
-                return;
-            }
-
-            navigation_result_ = BT::NodeStatus::FAILURE;
-            navigation_done_ = true;
-        };
-
-    navigation_client_->async_send_goal(goal_msg, send_goal_options);
+    if (!publishGoal(next_pose, true)) {
+        navigation_result_ = BT::NodeStatus::FAILURE;
+        navigation_done_ = true;
+        return BT::NodeStatus::FAILURE;
+    }
 
     RCLCPP_INFO(node_->get_logger(), "PatrolBetweenPoints: navigating to route[%zu] %.2f, %.2f",
                 current_index, next_pose.pose.position.x, next_pose.pose.position.y);
     return BT::NodeStatus::RUNNING;
 }
 
-BT::NodeStatus PatrolBetweenPoints::onStart() {
-    if (!ensureActionServer()) {
-        return BT::NodeStatus::FAILURE;
-    }
+BT::NodeStatus PatrolBetweenPoints::onStart()
+{
     if (!loadInputs()) {
         RCLCPP_ERROR(node_->get_logger(), "PatrolBetweenPoints: failed to load inputs");
+        return BT::NodeStatus::FAILURE;
+    }
+    if (!ensurePoseAvailable()) {
+        RCLCPP_WARN(node_->get_logger(), "PatrolBetweenPoints: robot pose unavailable, cannot start patrol");
         return BT::NodeStatus::FAILURE;
     }
 
@@ -442,8 +481,8 @@ BT::NodeStatus PatrolBetweenPoints::onStart() {
     navigation_done_ = false;
     navigation_result_ = BT::NodeStatus::RUNNING;
     patrol_active_ = true;
+    has_current_goal_ = false;
 
-    cancelExistingGoals();
     startMonitorLoop();
     if (paused_for_target_) {
         return BT::NodeStatus::RUNNING;
@@ -451,9 +490,21 @@ BT::NodeStatus PatrolBetweenPoints::onStart() {
     return sendNextGoal();
 }
 
-BT::NodeStatus PatrolBetweenPoints::onRunning() {
+BT::NodeStatus PatrolBetweenPoints::onRunning()
+{
     if (yield_requested_) {
         return BT::NodeStatus::FAILURE;
+    }
+    if (restart_requested_) {
+        restart_requested_ = false;
+        return sendNextGoal();
+    }
+    if (!paused_for_target_ && has_current_goal_ && currentGoalReached()) {
+        return sendNextGoal();
+    }
+    if (!paused_for_target_ && has_current_goal_ && republish_interval_ > 0.0 &&
+        (node_->now() - last_goal_publish_time_).seconds() >= republish_interval_) {
+        publishGoal(current_goal_, false);
     }
     if (navigation_done_) {
         return navigation_result_;
@@ -461,12 +512,16 @@ BT::NodeStatus PatrolBetweenPoints::onRunning() {
     return BT::NodeStatus::RUNNING;
 }
 
-void PatrolBetweenPoints::onHalted() {
+void PatrolBetweenPoints::onHalted()
+{
     patrol_active_ = false;
     stopMonitorLoop();
-    cancelCurrentGoal("halt");
+    yield_requested_ = false;
+    restart_requested_ = false;
     navigation_done_ = true;
     navigation_result_ = BT::NodeStatus::FAILURE;
     paused_for_target_ = false;
+    has_current_goal_ = false;
+    target_sub_.reset();
     RCLCPP_INFO(node_->get_logger(), "PatrolBetweenPoints: halted");
 }

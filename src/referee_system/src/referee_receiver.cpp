@@ -17,7 +17,7 @@ class SentryRefereeReceiver : public rclcpp::Node {
 public:
     SentryRefereeReceiver() : Node("referee_receiver") {
         // 声明串口参数
-        this->declare_parameter("serial_port", "/dev/stm32_robot_base"); // 虚拟串口
+        this->declare_parameter("serial_port", "/dev/ACM0"); // 虚拟串口
         this->declare_parameter("baud_rate", 115200);  // 波特率
         
         // 获取参数

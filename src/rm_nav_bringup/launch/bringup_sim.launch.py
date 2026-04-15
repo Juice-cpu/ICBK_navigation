@@ -97,7 +97,7 @@ def generate_launch_description():
 
     declare_LIO_cmd = DeclareLaunchArgument(
         'lio',
-        default_value='fast_lio',
+        default_value='fastlio',
         description='Choose lio alogrithm: fastlio or pointlio')
 
     # Specify the actions

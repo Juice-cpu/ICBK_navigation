@@ -18,7 +18,7 @@ def generate_launch_description():
 
     serial_port_arg = DeclareLaunchArgument(
         "serial_port",
-        default_value="/dev/stm32_robot_base",
+        default_value="/dev/stm32_serial",
         description="Serial port for referee receiver",
     )
 
@@ -38,7 +38,6 @@ def generate_launch_description():
         default_value="100",
         description="Behavior tree tick frequency in Hz",
     )
-
     behavior_tree_main_node = Node(
         package="icbk_sentry_bt",
         executable="behavior_tree_main",
