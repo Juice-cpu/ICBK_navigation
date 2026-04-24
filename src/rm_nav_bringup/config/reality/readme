@@ -1,0 +1,5 @@
+mppi调参顺序建议
+先调 approach_velocity
+再调 approach_distance
+再看 direct_approach_distance
+最后才碰 critic 权重

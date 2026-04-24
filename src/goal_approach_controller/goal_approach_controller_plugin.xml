@@ -1,0 +1,11 @@
+<library path="goal_approach_controller">
+  <class
+    name="goal_approach_controller::GoalApproachController"
+    type="goal_approach_controller::GoalApproachController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Nav2 controller wrapper that limits linear speed near the goal and can bypass the
+      inner controller for a direct final approach.
+    </description>
+  </class>
+</library>
