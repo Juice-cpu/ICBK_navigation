@@ -33,10 +33,12 @@ PatrolBetweenPoints::PatrolBetweenPoints(const std::string& name, const BT::Node
       position_tolerance_(0.25),
       yaw_tolerance_(0.35),
       republish_interval_(0.5),
+      stay_duration_(5.0),
       has_target_(false),
       target_active_(false),
       last_target_time_ns_(0),
-      has_current_goal_(false)
+      has_current_goal_(false),
+      arrived_at_goal_(false)
 {
     if (!node_) {
         rclcpp::NodeOptions options;
@@ -71,6 +73,7 @@ BT::PortsList PatrolBetweenPoints::providedPorts()
         BT::InputPort<double>("position_tolerance", 0.25, "Goal position tolerance in meters"),
         BT::InputPort<double>("yaw_tolerance", 0.35, "Goal yaw tolerance in radians"),
         BT::InputPort<double>("republish_interval", 0.5, "Goal republish interval in seconds"),
+        BT::InputPort<double>("stay_duration", 5.0, "Seconds to stay at each waypoint before moving to next"),
         BT::InputPort<std::string>("map_frame", "map", "Global frame"),
         BT::InputPort<std::string>("robot_frame", "base_link", "Robot base frame"),
         BT::InputPort<SentryRefereeReceiver*>("key_port")
@@ -173,6 +176,7 @@ bool PatrolBetweenPoints::loadInputs()
         republish_interval_ = getInput<double>("republish_interval").value();
         map_frame_ = getInput<std::string>("map_frame").value();
         robot_frame_ = getInput<std::string>("robot_frame").value();
+        stay_duration_ = getInput<double>("stay_duration").value();
         return true;
     } catch (const std::exception&) {
         return false;
@@ -290,7 +294,7 @@ void PatrolBetweenPoints::monitorLoop()
             break;
         }
 
-        if (targetCurrentlyVisible()) {
+        if (target_timeout_ > 0 && targetCurrentlyVisible()) {
             if (!paused_for_target_) {
                 RCLCPP_INFO(node_->get_logger(), "PatrolBetweenPoints: target visible, pausing patrol");
                 paused_for_target_ = true;
@@ -391,22 +395,7 @@ bool PatrolBetweenPoints::currentGoalReached() const
     const double dy = current_goal_.pose.position.y - robot_pose.pose.position.y;
     const double distance = std::hypot(dx, dy);
 
-    tf2::Quaternion goal_q;
-    tf2::fromMsg(current_goal_.pose.orientation, goal_q);
-    double goal_roll = 0.0;
-    double goal_pitch = 0.0;
-    double goal_yaw = 0.0;
-    tf2::Matrix3x3(goal_q).getRPY(goal_roll, goal_pitch, goal_yaw);
-
-    tf2::Quaternion robot_q;
-    tf2::fromMsg(robot_pose.pose.orientation, robot_q);
-    double robot_roll = 0.0;
-    double robot_pitch = 0.0;
-    double robot_yaw = 0.0;
-    tf2::Matrix3x3(robot_q).getRPY(robot_roll, robot_pitch, robot_yaw);
-
-    const double yaw_error = std::fabs(normalizeAngle(goal_yaw - robot_yaw));
-    return distance <= position_tolerance_ && yaw_error <= yaw_tolerance_;
+    return distance <= position_tolerance_;
 }
 
 BT::NodeStatus PatrolBetweenPoints::sendNextGoal()
@@ -428,6 +417,7 @@ BT::NodeStatus PatrolBetweenPoints::sendNextGoal()
         navigation_result_ = BT::NodeStatus::RUNNING;
         current_goal_ = next_pose;
         has_current_goal_ = true;
+        arrived_at_goal_ = false;
     }
 
     if (!publishGoal(next_pose, true)) {
@@ -455,19 +445,21 @@ BT::NodeStatus PatrolBetweenPoints::onStart()
     has_target_ = false;
     target_active_ = false;
     last_target_time_ns_ = 0;
-    target_sub_ = node_->create_subscription<std_msgs::msg::String>(
-        target_topic_, rclcpp::SensorDataQoS(),
-        [this](const std_msgs::msg::String::SharedPtr msg) {
-            const char* raw = msg->data.c_str();
-            char* end = nullptr;
-            const double flag = std::strtod(raw, &end);
-            target_active_ = (end != raw) && (flag > 0.5);
-            has_target_ = true;
-            last_target_time_ns_ = node_->now().nanoseconds();
-        });
+    if (target_timeout_ > 0) {
+        target_sub_ = node_->create_subscription<std_msgs::msg::String>(
+            target_topic_, rclcpp::SensorDataQoS(),
+            [this](const std_msgs::msg::String::SharedPtr msg) {
+                const char* raw = msg->data.c_str();
+                char* end = nullptr;
+                const double flag = std::strtod(raw, &end);
+                target_active_ = (end != raw) && (flag > 0.5);
+                has_target_ = true;
+                last_target_time_ns_ = node_->now().nanoseconds();
+            });
+    }
 
     const bool hp_yield = shouldYieldForHp();
-    const bool target_visible = targetCurrentlyVisible();
+    const bool target_visible = target_timeout_ > 0 && targetCurrentlyVisible();
     if (hp_yield) {
         return BT::NodeStatus::FAILURE;
     }
@@ -482,6 +474,7 @@ BT::NodeStatus PatrolBetweenPoints::onStart()
     navigation_result_ = BT::NodeStatus::RUNNING;
     patrol_active_ = true;
     has_current_goal_ = false;
+    arrived_at_goal_ = false;
 
     startMonitorLoop();
     if (paused_for_target_) {
@@ -497,10 +490,23 @@ BT::NodeStatus PatrolBetweenPoints::onRunning()
     }
     if (restart_requested_) {
         restart_requested_ = false;
+        arrived_at_goal_ = false;
         return sendNextGoal();
     }
     if (!paused_for_target_ && has_current_goal_ && currentGoalReached()) {
-        return sendNextGoal();
+        if (!arrived_at_goal_) {
+            arrived_at_goal_ = true;
+            arrival_time_ = node_->now();
+            RCLCPP_INFO(node_->get_logger(), "PatrolBetweenPoints: arrived at waypoint, staying for %.1f seconds",
+                        stay_duration_);
+        }
+        const double elapsed = (node_->now() - arrival_time_).seconds();
+        if (elapsed >= stay_duration_) {
+            RCLCPP_INFO(node_->get_logger(), "PatrolBetweenPoints: stay duration elapsed, moving to next waypoint");
+            arrived_at_goal_ = false;
+            return sendNextGoal();
+        }
+        return BT::NodeStatus::RUNNING;
     }
     if (!paused_for_target_ && has_current_goal_ && republish_interval_ > 0.0 &&
         (node_->now() - last_goal_publish_time_).seconds() >= republish_interval_) {
@@ -522,6 +528,7 @@ void PatrolBetweenPoints::onHalted()
     navigation_result_ = BT::NodeStatus::FAILURE;
     paused_for_target_ = false;
     has_current_goal_ = false;
+    arrived_at_goal_ = false;
     target_sub_.reset();
     RCLCPP_INFO(node_->get_logger(), "PatrolBetweenPoints: halted");
 }

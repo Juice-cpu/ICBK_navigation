@@ -11,27 +11,6 @@
     </Fallback>
   </BehaviorTree>
 
-  <!-- Robot status check (fallback safety) -->
-  <BehaviorTree ID="check_robot_status">
-    <Fallback>
-      <IsStatusOK ammo_min="0"
-                  heat_max="350"
-                  hp_min="200"
-                  key_port="{referee_data}"/>
-      <ForceFailure>
-        <Fallback>
-          <IsRfidDetected friendly_supply_zone_exchange="false"
-                          friendly_supply_zone_non_exchange="true"
-                          center_gain_point="false"
-                          friendly_fortress_gain_point="false"
-                          key_port="{referee_data}"/>
-          <PubNav2Goal goal="0;0;0"
-                       topic_name="goal_pose"/>
-        </Fallback>
-      </ForceFailure>
-    </Fallback>
-  </BehaviorTree>
-
   <!-- Core behavior tree -->
   <BehaviorTree ID="rmul_2025">
     <KeepRunningUntilFailure>
@@ -73,9 +52,9 @@
                             heat_max="350"
                             hp_min="200"
                             key_port="{referee_data}"/>
-                <!-- Patrol uses a single fixed point for now -->
-                <PatrolBetweenPoints high_points="4.50;-2.10;0"
-                                     low_points="4.50;-2.10;0"
+                <!-- Patrol uses a two-point loop route -->
+                <PatrolBetweenPoints high_points="3.55;-0.24;0|4.09;-1.73;0"
+                                     low_points="3.55;-0.24;0|4.09;-1.73;0"
                                      hp_switch_threshold="200"
                                      hp_abort_threshold="200"
                                      target_topic="/auto_aim_target_pos"
@@ -97,13 +76,6 @@
       <input_port name="expected_game_progress" default="4" type="int">Expected game progress stage</input_port>
       <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
     </Condition>
-    <Condition ID="IsRfidDetected">
-      <input_port name="friendly_supply_zone_exchange" default="false" type="bool">Friendly supply zone exchange</input_port>
-      <input_port name="friendly_supply_zone_non_exchange" default="false" type="bool">Friendly supply zone non-exchange</input_port>
-      <input_port name="center_gain_point" default="false" type="bool">Center gain point</input_port>
-      <input_port name="friendly_fortress_gain_point" default="false" type="bool">Friendly fortress gain point</input_port>
-      <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
-    </Condition>
     <Condition ID="IsStatusOK">
       <input_port name="ammo_min" default="0" type="int">Lower then minimum ammo will return FAILURE</input_port>
       <input_port name="heat_max" default="350" type="int">Maximum heat. NOTE: Sentry heat limit is 400</input_port>
@@ -115,9 +87,9 @@
       <input_port name="exit_hp" default="220" type="int">Exit return-home mode above this HP</input_port>
       <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
     </Condition>
-    <Condition ID="PubNav2Goal">
-      <input_port name="goal" default="0;0;0" type="geometry_msgs::msg::PoseStamped_&lt;std::allocator&lt;void&gt; &gt;">Expected goal pose that send to nav2. Fill with format `x;y;yaw`</input_port>
-      <input_port name="topic_name" default="__default__placeholder__" type="std::string">Topic name</input_port>
+    <Condition ID="IsTargetVisible">
+      <input_port name="target_topic" default="/auto_aim_target_pos" type="std::string">Target topic</input_port>
+      <input_port name="timeout" default="0.5" type="double">Seconds to consider target valid</input_port>
     </Condition>
     <Action ID="PatrolBetweenPoints">
       <input_port name="high_points" type="std::string">High HP patrol route, split by | with x;y;yaw</input_port>
@@ -128,36 +100,8 @@
       <input_port name="target_timeout" default="0.5" type="double">Target validity timeout inside patrol</input_port>
       <input_port name="key_port" type="SentryRefereeReceiver*">Referee data source pointer</input_port>
     </Action>
-    <Action ID="PublishSpinSpeed">
-      <input_port name="spin_speed" default="0.000000" type="double">Angular Z velocity (rad/s)</input_port>
-      <input_port name="duration" type="std::chrono::milliseconds">Publish then sleep duration in milliseconds</input_port>
-      <input_port name="topic_name" default="__default__placeholder__" type="std::string">Topic name</input_port>
-    </Action>
-    <Action ID="PublishTwist">
-      <input_port name="v_y" default="0.000000" type="double">Linear Y velocity (m/s)</input_port>
-      <input_port name="v_yaw" default="0.000000" type="double">Angular Z velocity (rad/s)</input_port>
-      <input_port name="v_x" default="0.000000" type="double">Linear X velocity (m/s)</input_port>
-      <input_port name="duration" type="std::chrono::milliseconds">Publish then sleep duration in milliseconds</input_port>
-      <input_port name="topic_name" default="__default__placeholder__" type="std::string">Topic name</input_port>
-    </Action>
     <Action ID="CancelNavigation"/>
-    <Condition ID="IsTargetVisible">
-      <input_port name="target_topic" default="/armor_solver/target" type="std::string">Target topic</input_port>
-      <input_port name="timeout" default="1.0" type="double">Seconds to consider target valid</input_port>
-    </Condition>
-    <Condition ID="EnemyVisibleFromTopic">
-      <input_port name="target_topic" default="/armor_solver/target" type="std::string">Target topic</input_port>
-      <input_port name="timeout" default="1.0" type="double">Seconds to consider target valid</input_port>
-    </Condition>
-    <Action ID="ChaseTarget">
-      <input_port name="target_topic" default="/armor_solver/target" type="std::string">Target topic</input_port>
-      <input_port name="follow_distance" default="2.0" type="double">Follow distance behind target (m)</input_port>
-      <input_port name="prediction_horizon" default="0.2" type="double">Predict position by velocity * horizon (s)</input_port>
-      <input_port name="topic_name" default="goal_pose" type="std::string">Topic name for PoseStamped goal</input_port>
-    </Action>
     <Action ID="ReturnHome">
       <input_port name="home_point" type="geometry_msgs::msg::PoseStamped_&lt;std::allocator&lt;void&gt; &gt;">Home pose sent directly to NavigateToPose</input_port>
     </Action>
   </TreeNodesModel>
-
-</root>

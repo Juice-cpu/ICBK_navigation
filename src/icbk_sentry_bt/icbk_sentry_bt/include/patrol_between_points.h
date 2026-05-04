@@ -85,6 +85,7 @@ private:
     double position_tolerance_;
     double yaw_tolerance_;
     double republish_interval_;
+    double stay_duration_;
 
     std::atomic<bool> has_target_;
     std::atomic<bool> target_active_;
@@ -92,6 +93,8 @@ private:
     geometry_msgs::msg::PoseStamped current_goal_;
     rclcpp::Time last_goal_publish_time_;
     bool has_current_goal_;
+    bool arrived_at_goal_;
+    rclcpp::Time arrival_time_;
 };
 
 inline rclcpp::Node::SharedPtr PatrolBetweenPoints::node_ = nullptr;

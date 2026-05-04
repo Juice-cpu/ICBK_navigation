@@ -65,6 +65,7 @@ install(
 
 install(FILES
   behavior_trees/sentry_behavior.xml
+  behavior_trees/rmul_2026.xml
   DESTINATION share/${PROJECT_NAME}/behavior_trees/
 )
 
