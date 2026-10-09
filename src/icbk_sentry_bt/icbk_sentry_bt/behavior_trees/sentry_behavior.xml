@@ -23,18 +23,20 @@
                               key_port="{referee_data}"/>
                 <IsEcDecisionGoHome key_port="{referee_data}"/>
               </Fallback>
-              <PubNav2Goal goal="-0.529505;-2.44311;0"
+              <PubNav2Goal goal="-1.1994;-4.1847;0"
                            topic_name="goal_pose"
                            republish_interval="0.5"/>
             </Sequence>
 
             <!-- 第二优先级：己方前哨站血量归零后，切换到登堡垒目标点。 -->
+            <!--
             <Sequence>
               <IsAllyOutpostDestroyed key_port="{referee_data}"/>
               <PubNav2Goal goal="3.08;-0.43;0"
                            topic_name="goal_pose"
                            republish_interval="0.5"/>
             </Sequence>
+            -->
 
             <!-- 第三优先级：视觉模式 - 检测到目标时急停，等目标消失后恢复巡逻。 -->
             <Sequence>
@@ -45,26 +47,20 @@
               <PublishTwist v_x="0.0" v_y="0.0" v_yaw="0.0" topic_name="cmd_vel"/>
             </Sequence>
 
-            <!-- 最后兜底：非低血状态下(HP>=300)，按常规策略去默认巡逻/压制点。 -->
+            <!-- 最后兜底：血量大于350并且电控允许时，才可以出家执行巡逻任务。 -->
             <Sequence>
               <Inverter>
-                <LowHpLatched enter_hp="300"
-                              exit_hp="320"
+                <LowHpLatched enter_hp="350"
+                              exit_hp="370"
                               key_port="{referee_data}"/>
               </Inverter>
-              <Fallback>
-                <IsStatusOK ammo_min="0"
-                            heat_max="350"
-                            hp_min="300"
-                            key_port="{referee_data}"/>
-                <IsEcDecisionGoOut key_port="{referee_data}"/>
-              </Fallback>
-              <PatrolBetweenPoints  high_points="3.28272;0.426171;0|3.18745;-1.60831;0"
+              <IsEcDecisionGoOut key_port="{referee_data}"/>
+              <PatrolBetweenPoints  high_points="4.4942;1.6339;0|4.3562;-2.4328;0"
                                     low_points="3.18;-1.60;0|3.71;-1.63;0"
                                     hp_switch_threshold="300"
                                     hp_abort_threshold="290"
                                     target_timeout="0"
-                                    stay_duration="5.0"
+                                    stay_duration="60.0"
                                     topic_name="goal_pose"
                                     key_port="{referee_data}"/>
             </Sequence>
