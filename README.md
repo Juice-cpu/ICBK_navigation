@@ -1,254 +1,278 @@
-# PB_RM_Simulation
+# 广州航海学院哨兵机器人导航算法
+
+![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-22314E?logo=ros)
+![Ubuntu 22.04](https://img.shields.io/badge/Ubuntu-22.04-E95420?logo=ubuntu)
+![Gazebo Classic](https://img.shields.io/badge/Gazebo-Classic%2011-FF8C00)
+![C++ / Python](https://img.shields.io/badge/language-C%2B%2B%20%7C%20Python-3776AB)
+
+这是广州航海学院 RoboMaster 哨兵机器人的导航算法工作空间。项目以 ROS 2 Humble、Gazebo Classic 和 Navigation2 为基础，把激光雷达仿真、LIO 里程计、定位建图、全局规划、TEB 局部规划、代价地图和比赛决策行为树连接起来，覆盖从“传感器数据”到“底盘速度指令”的完整链路。
+
+仓库同时保留了仿真和实车入口。仿真中可以复现 RMUL/RMUC 场地、动态障碍物、巡逻、目标追击和低血量回家等行为；实车端只需替换传感器、地图和底盘通信参数即可沿用同一套 Nav2 接口。
+
+## 效果预览
+
+| Gazebo 场地与机器人 | LIO 点云与 Navigation2 |
+| :---: | :---: |
+| ![Gazebo 仿真](.docs/Gazebo_Simulation.png) | ![FAST-LIO / Nav2](.docs/FAST_LIO+Nav2.png) |
+
+| RMUL 场地导航 | 动态避障 | 轨迹跟踪 |
+| :---: | :---: | :---: |
+| ![RMUL Gazebo](.docs/gazebo_RMUL.png) | ![动态避障](.docs/2024.5.11RMUL动态避障2.gif) | ![轨迹跟踪](.docs/2024.5.11RMUC轨迹跟踪一键偷家.gif) |
+
+## 系统总览
+
+~~~mermaid
+flowchart LR
+    A[Gazebo / Livox Mid-360] --> B[点云与 IMU]
+    B --> C[FAST-LIO 或 Point-LIO]
+    B --> D[地面分割]
+    D --> E[PointCloud2 转 LaserScan]
+    C --> F[odom / TF]
+    E --> G[SLAM Toolbox、AMCL 或 ICP]
+    F --> G
+    G --> H[Nav2 全局规划 + 代价地图]
+    H --> I[TEB 局部规划器]
+    I --> J[/cmd_vel]
+    K[裁判系统串口] --> L[哨兵行为树]
+    M[目标跟踪 /auto_aim_target_pos] --> L
+    L --> N[/goal_pose 或急停]
+    N --> H
+~~~
+
+导航链路的职责可以按下面的方式理解：
+
+| 层级 | 当前实现 | 作用 |
+| --- | --- | --- |
+| 传感器仿真 / 驱动 | `pb_rm_simulation`、`livox_ros_driver2` | 提供 Mid-360 点云、IMU 和机器人运动仿真 |
+| 状态估计 | FAST-LIO、Point-LIO、IMU complementary filter | 输出高频里程计和 `odom → lidar_odom` 相关 TF |
+| 感知预处理 | linefit 地面分割、`pointcloud_to_laserscan` | 从三维点云提取障碍物与二维扫描 |
+| 定位 / 建图 | SLAM Toolbox、AMCL、ICP registration | 建图、已知地图定位或点云初始配准 |
+| 规划控制 | Nav2、Navfn、TEB、costmap | 规划可行路径，避障并输出速度 |
+| 任务决策 | `icbk_sentry_bt`、`armor_chaser` | 根据比赛状态、血量和目标信息切换任务 |
+
+## 决策行为树：仿真中能看到什么
+
+默认行为树位于 [`sentry_behavior.xml`](src/icbk_sentry_bt/icbk_sentry_bt/behavior_trees/sentry_behavior.xml)，启动文件是 [`sentry_behavior_launch.py`](src/icbk_sentry_bt/icbk_sentry_bt/launch/sentry_behavior_launch.py)。它以反应式优先级结构运行，每次 tick 都会重新检查高优先级条件：
+
+~~~mermaid
+flowchart TD
+    S[比赛阶段有效？] -->|否| W[等待并保持当前状态]
+    S -->|是| H{低血量或电控要求回家？}
+    H -->|是| R[发布回家点 /goal_pose]
+    H -->|否| T{检测到目标？}
+    T -->|是| P[发布当前位置为目标点<br/>并向 /cmd_vel 发布 0 速度]
+    T -->|否| O{血量足够且电控允许出家？}
+    O -->|否| Q[保持当前位置或等待]
+    O -->|是| Y[按高血量 / 低血量路线巡逻]
+~~~
+
+| 决策分支 | 代码中的条件 | 在仿真里的可观察现象 |
+| --- | --- | --- |
+| 比赛开始门控 | `IsGameStatus` | 行为树未进入任务前，机器人不会自动巡逻 |
+| 低血量回家 | `LowHpLatched`、`IsEcDecisionGoHome` | `/goal_pose` 切换到 home 点，RViz 中出现回家路径 |
+| 目标出现 | `IsTargetVisible` | 当前位姿被重新发布为目标，`/cmd_vel` 发布零速度，机器人急停 |
+| 出家巡逻 | `IsEcDecisionGoOut`、`PatrolBetweenPoints` | `goal_pose` 在巡逻点之间循环，Nav2 规划路径并避障 |
+| 血量分级路线 | `high_points`、`low_points`、`hp_switch_threshold` | 血量跨过阈值后切换巡逻路线；进入低血量阈值时让出导航 |
+| 目标追击 | `armor_chaser` | 将目标位置、速度和朝向转换为追击点，持续更新 `navigate_to_pose` |
+
+建议在仿真时同时打开 RViz 和以下监视终端，决策过程就可以被“显现”出来：
+
+~~~bash
+ros2 topic echo /goal_pose geometry_msgs/msg/PoseStamped
+ros2 topic echo /cmd_vel geometry_msgs/msg/Twist
+ros2 topic echo /referee/sentry_hp std_msgs/msg/UInt16
+ros2 topic echo /referee/time_remaining std_msgs/msg/UInt16
+ros2 topic echo /referee/home_arrived_flag std_msgs/msg/UInt8
+~~~
+
+`icbk_sentry_bt` 的裁判数据来自串口帧，因此纯 Gazebo 环境没有真实裁判机时，Nav2、巡逻、目标急停可以直接验证；血量、比赛阶段和电控出入家分支需要接入裁判串口或后续添加仿真裁判数据源。这个边界在 README 中明确标出，便于区分“导航仿真已运行”和“比赛决策输入已注入”。
+
+## 主要功能包
+
+| 功能包 | 说明 |
+| --- | --- |
+| [`rm_nav_bringup`](src/rm_nav_bringup) | 仿真 / 实车总启动，地图、点云、参数、RViz 和机器人模型 |
+| [`pb_rm_simulation`](src/rm_simulation/pb_rm_simulation) | Gazebo Classic 场地、机器人模型、障碍物插件 |
+| [`icbk_sentry_bt`](src/icbk_sentry_bt/icbk_sentry_bt) | 行为树主程序、裁判串口接收、巡逻与回家决策 |
+| [`armor_chaser`](src/armor_chaser) | 基于装甲板跟踪结果的动态目标追击状态机 |
+| [`goal_approach_controller`](src/goal_approach_controller) | 接近终点时限速并改善贴点效果的 Nav2 控制器包装器 |
+| [`multi_point_navigation`](src/multi_point_navigation) | 将 `/goal_pose` 转发到 Nav2 `NavigateToPose` action |
+| [`serpentine_patrol`](src/serpentine_patrol) | 通过多个路径点执行 S 形巡逻任务 |
+| `rm_localization` | FAST-LIO、Point-LIO、ICP registration |
+| `rm_navigation` | Nav2 启动、TEB local planner、costmap 和恢复行为 |
+| `rm_interfaces` | 目标跟踪和裁判系统相关 ROS 2 消息定义 |
 
-深圳北理莫斯科大学 北极熊战队 哨兵导航仿真/实车包
+## 环境与依赖
 
-## 一. 项目介绍
+已验证的基础环境：
 
-本项目使用全向移动小车，附加 Livox Mid360 雷达与 IMU，在 RMUC/RMUL 地图进行导航算法仿真，仅需要调整参数即可移植到真实机器人中导航。
+- Ubuntu 22.04
+- ROS 2 Humble
+- Gazebo Classic 11
+- `colcon`、`rosdep`、RViz2
+- Livox SDK2（实车 Mid-360 驱动需要）
 
-早期功能演示视频：[寒假在家，怎么调车！？更适合新手宝宝的 RM 导航仿真](https://b23.tv/xSNQGmb)
+源码安装：
 
-|Gazebo 仿真|Fast_LIO/Point_LIO + Navigation2|
-|:-:|:-:|
-|![Gazebo 仿真](.docs/gazebo_RMUL.png)|![Fast_LIO/Point_LIO + Navigation2](.docs/FAST_LIO+Nav2.png)|
+~~~bash
+git clone --recursive https://github.com/Juice-cpu/ICBK_navigation.git
+cd ICBK_navigation
+source /opt/ros/humble/setup.bash
+rosdep update
+rosdep install -r --from-paths src --ignore-src --rosdistro humble -y
+colcon build --symlink-install
+source install/setup.bash
+~~~
 
-|动态避障|
-|:-:|
-|![Gazebo 仿真](.docs/2024.5.11RMUL动态避障2.gif)|
+如果使用 VS Code Dev Container，可直接使用仓库中的 [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) 和 [`dockerfile`](dockerfile) 创建开发环境。首次编译建议保留 `--symlink-install`，这样修改 launch、参数或行为树后无需重复安装文件。
 
-|一键偷家|
-|:-:|
-|![Gazebo 仿真](.docs/2024.5.11RMUC轨迹跟踪一键偷家.gif)|
+## 仿真快速开始
 
-### 1.1 rm_simulation 话题接口
+### 1. 启动 Gazebo、定位与 Nav2
 
-| **Topic name**      | **Type**                        | **Note**                         |
-|:-------------------:|:-------------------------------:|:--------------------------------:|
-| /livox/lidar             | livox_ros_driver2/msg/CustomMsg | Mid360 自定义消息类型   |
-| /livox/lidar/pointcloud | sensor_msgs/msg/PointCloud2     | ROS2 点云消息类型                      |
-| /livox/imu                | sensor_msgs/msg/Imu             | Gazebo 插件仿真 IMU                  |
-| /cmd_vel            | geometry_msgs/msg/Twist         | 全向小车运动控制接口                  |
+RMUL 和 RMUC 是当前 Gazebo 启动文件支持的场地名称；`world`、`map` 和 `PCD` 文件使用同名命名约定。
 
-### 1.2 整体框图
+~~~bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
 
-![功能包流程图](.docs/功能包流程图.png)
+ros2 launch rm_nav_bringup bringup_sim.launch.py \
+  world:=RMUL \
+  mode:=nav \
+  lio:=pointlio \
+  localization:=slam_toolbox \
+  lio_rviz:=False \
+  nav_rviz:=True
+~~~
 
-## 二. 环境配置
+启动参数：
 
-当前开发环境为 Ubuntu22.04, ROS2 humble, Gazebo Classic 11.10.0
+| 参数 | 可选值 | 说明 |
+| --- | --- | --- |
+| `world` | `RMUL`、`RMUC` | Gazebo 场地，并选择同名地图 / 点云资源 |
+| `mode` | `nav`、`mapping` | 已知地图导航，或边建图边导航 |
+| `lio` | `fastlio`、`pointlio` | 选择 LIO 里程计 |
+| `localization` | `slam_toolbox`、`amcl`、`icp` | `mode:=nav` 时选择定位方式 |
+| `lio_rviz` | `True`、`False` | 是否打开 LIO 点云 RViz |
+| `nav_rviz` | `True`、`False` | 是否打开 Nav2 RViz |
 
-### 方式一：使用 Docker
+边建图示例：
 
-本项目已配置基础 Dockerfile，并可使用 [Dev Container](https://containers.dev/) 进行仿真测试和开发。
+~~~bash
+ros2 launch rm_nav_bringup bringup_sim.launch.py \
+  world:=RMUL mode:=mapping lio:=pointlio \
+  lio_rviz:=False nav_rviz:=True
+~~~
 
-> DevContainer 的一个特征是将代码的运行环境与代码本身完全隔离开来，在效果上类似将 workspace 挂载到了容器中。  
-> 在 Docker-image 中仅仅包含有关系统的配置（例如修改 .baserc 或安装依赖包等），其本身不存储任何项目代码和工作空间，做到了代码与环境的完全隔离。  
-> 可以通过 devcontainer.json 配置文件，快速修改和分发容器配置。  
-> 与 VSCode 深度融合，一键启动，无需任何命令。
+### 2. 发布一个导航目标
 
-镜像仓库地址：[DockerHub: lihanchen2004/pb_rm_simulation](https://hub.docker.com/repository/docker/lihanchen2004/pb_rm_simulation)
+先确认 `navigate_to_pose` action server 已启动，再发布地图坐标系下的目标点：
+
+~~~bash
+ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
+  "{header: {frame_id: map}, pose: {position: {x: 2.0, y: -1.0, z: 0.0}, orientation: {z: 0.0, w: 1.0}}}"
+~~~
 
-1. 安装 Docker
+在 RViz 中可同时观察地图、TF、全局路径、局部轨迹、局部代价地图和机器人位姿。仿真中的 Nav2 控制器当前使用 `teb_local_planner::TebLocalPlannerROS`；实车参数对速度、障碍物间距、前向行驶约束和膨胀区权重做了单独调整。
 
-2. 拉取镜像
+### 3. 启动行为树
 
-    ```sh
-    docker pull lihanchen2004/pb_rm_simulation:1.0.0
-    ```
+行为树启动文件会读取裁判系统串口。实车默认使用 `/dev/stm32_serial`，也可以显式指定端口、波特率和 XML：
 
-3. 在宿主机 VSCode 中 安装 `ms-vscode-remote.remote-containers` 插件
+~~~bash
+ros2 launch icbk_sentry_bt sentry_behavior_launch.py \
+  behavior_tree_file:=$(ros2 pkg prefix icbk_sentry_bt)/share/icbk_sentry_bt/behavior_trees/sentry_behavior.xml \
+  serial_port:=/dev/stm32_serial \
+  baud_rate:=115200 \
+  bt_tick_hz:=100
+~~~
 
-4. 快捷键 `Ctrl+Shift+P`， 输入并点击 `Dev Containers:Rebuild and Reopen in Container`
+行为树运行时重点查看：
 
-### 方式二：源码安装
+~~~bash
+ros2 topic echo /goal_pose geometry_msgs/msg/PoseStamped
+ros2 topic echo /cmd_vel geometry_msgs/msg/Twist
+~~~
 
-1. 克隆仓库
+目标检测接口为 `rm_interfaces/msg/Target`，默认话题是 `/auto_aim_target_pos`。要验证“目标出现后急停”分支，需发布 `tracking: true` 的目标消息；要验证血量和比赛状态分支，需接入裁判串口帧。
 
-    ```sh
-    git clone --recursive https://gitee.com/SMBU-POLARBEAR/pb_rmsimulation --depth=1
-    ```
+例如，下面的消息可以在地图坐标系中模拟一个被跟踪目标，并观察 `/goal_pose` 与 `/cmd_vel` 的变化：
 
-2. 安装 [Livox SDK2](https://github.com/Livox-SDK/Livox-SDK2)
+~~~bash
+ros2 topic pub --once /auto_aim_target_pos rm_interfaces/msg/Target \
+  "{header: {frame_id: map}, tracking: true, id: enemy, armors_num: 1, position: {x: 2.0, y: -1.0, z: 0.0}, velocity: {x: 0.0, y: 0.0, z: 0.0}, yaw: 0.0, v_yaw: 0.0, radius_1: 0.0, radius_2: 0.0, d_zc: 0.0, d_za: 0.0}"
+~~~
 
-    ```sh
-    sudo apt install cmake
-    ```
+### 4. 目标追击
 
-    ```sh
-    git clone https://github.com/Livox-SDK/Livox-SDK2.git
-    cd ./Livox-SDK2/
-    mkdir build
-    cd build
-    cmake .. && make -j
-    sudo make install
-    ```
+Nav2 正常运行后，可以启动装甲板目标追击节点：
 
-3. 安装依赖
+~~~bash
+ros2 launch armor_chaser chase_state_machine.launch.py \
+  goal_frame:=map \
+  follow_distance:=0.5 \
+  lost_timeout:=1.0 \
+  replan_period:=0.3
+~~~
 
-    ```sh
-    cd pb_rm_simulation
+节点会对目标位置和速度做前视预测、低通平滑，并在目标周围的 costmap 中选择可行追击点；目标短时丢失时保留预测，超过超时后取消 Nav2 目标。
 
-    rosdep install -r --from-paths src --ignore-src --rosdistro $ROS_DISTRO -y
-    ```
+## 实车启动与适配
 
-4. 编译
+实车启动入口：
 
-    ```sh
-    colcon build --symlink-install
-    ```
+~~~bash
+ros2 launch rm_nav_bringup bringup_real.launch.py \
+  world:=YOUR_WORLD_NAME \
+  mode:=nav \
+  lio:=pointlio \
+  localization:=slam_toolbox \
+  lio_rviz:=False \
+  nav_rviz:=True
+~~~
 
-## 三. 运行
+首次适配重点检查：
 
-### 3.1 可选参数
-
-1. `world`:
+1. 在 [`MID360_config.json`](src/rm_nav_bringup/config/reality/MID360_config.json) 中填写雷达 IP 和外参。
+2. 在 [`measurement_params_real.yaml`](src/rm_nav_bringup/config/reality/measurement_params_real.yaml) 中填写雷达相对 `base_link` 的位置。
+3. 在 [`segmentation_real.yaml`](src/rm_nav_bringup/config/reality/segmentation_real.yaml) 中填写雷达离地高度。
+4. 将同名的 `.yaml/.pgm` 地图放入 [`src/rm_nav_bringup/map`](src/rm_nav_bringup/map)，将 `.pcd` 放入 [`src/rm_nav_bringup/PCD`](src/rm_nav_bringup/PCD)。
+5. 根据底盘尺寸和速度上限调整 [`nav2_params_real.yaml`](src/rm_nav_bringup/config/reality/nav2_params_real.yaml) 中的 `robot_radius`、TEB 速度、加速度和障碍物距离。
+6. 启动 [`real_vel_transform`](src/rm_navigation/real_vel_transform) 将 Nav2 速度接口转换为底盘通信接口。
 
-    - 仿真模式
-        - `RMUL` - [2024 Robomaster 3V3 场地](https://bbs.robomaster.com/forum.php?mod=viewthread&tid=22942&extra=page%3D1)
-        - `RMUC` - [2024 Robomaster 7V7 场地](https://bbs.robomaster.com/forum.php?mod=viewthread&tid=22942&extra=page%3D1)
+保存点云时，在 LIO 参数中打开 `pcd_save_en`，再调用：
 
-    - 真实环境
-        - 自定，world 等价于 `.pcd(ICP使用的点云图)` 文件和 `.yaml(Nav使用的栅格地图)` 的名称
+~~~bash
+ros2 service call /map_save std_srvs/srv/Trigger
+~~~
 
-2. `mode`:
-   - `mapping` - 边建图边导航
-   - `nav` - 已知全局地图导航
+## 常用接口
 
-3. `lio`:
-   - `fastlio` - 使用 [Fast_LIO](https://github.com/LihanChen2004/FAST_LIO/tree/ROS2)，里程计约 10Hz
-   - `pointlio` - 使用 [Point_LIO](https://github.com/LihanChen2004/Point-LIO/tree/RM2024_SMBU_auto_sentry)，可以输出100+Hz的Odometry，对导航更友好，但相对的，CPU占用会更高
+| 接口 | 类型 | 用途 |
+| --- | --- | --- |
+| `/livox/lidar` | `livox_ros_driver2/msg/CustomMsg` | Mid-360 原始点云 |
+| `/livox/lidar/pointcloud` | `sensor_msgs/msg/PointCloud2` | ROS 2 点云 |
+| `/livox/imu` | `sensor_msgs/msg/Imu` | 仿真或实车 IMU |
+| `/Odometry` | `nav_msgs/msg/Odometry` | LIO 输出里程计 |
+| `/scan` | `sensor_msgs/msg/LaserScan` | 点云转换后的二维扫描 |
+| `/goal_pose` | `geometry_msgs/msg/PoseStamped` | 行为树 / 上层任务发送的导航目标 |
+| `/cmd_vel` | `geometry_msgs/msg/Twist` | 底盘速度指令 |
+| `/auto_aim_target_pos` | `rm_interfaces/msg/Target` | 目标跟踪结果 |
+| `/referee/sentry_hp` | `std_msgs/msg/UInt16` | 哨兵血量显示 |
+| `/referee/time_remaining` | `std_msgs/msg/UInt16` | 比赛剩余时间 |
 
-4. `localization` (仅 `mode:=nav` 时本参数有效)
-   - `slam_toolbox` - 使用 [slam_toolbox](https://github.com/SteveMacenski/slam_toolbox) localization 模式定位，动态场景中效果更好
-   - `amcl` - 使用 [AMCL](https://navigation.ros.org/configuration/packages/configuring-amcl.html) 经典算法定位
-   - `icp` - 使用 [icp_registration](https://github.com/baiyeweiguang/CSU-RM-Sentry/tree/main/src/rm_localization/icp_registration)，仅在第一次启动或者手动设置 /initialpose 时进行点云配准。获得初始位姿后只依赖 LIO 进行定位，没有回环检测，在长时间运行后可能会出现累积误差。
+## 排查顺序
 
-    Tips:
-    1. 若使用 AMCL 算法定位时，启动后需要在 rviz2 中手动给定初始位姿。
-    2. 若使用 slam_toolbox 定位，需要提供 .posegraph 地图，详见 [如何保存 .pgm 和 .posegraph 地图？](https://gitee.com/SMBU-POLARBEAR/pb_rmsimulation/issues/I9427I)
-    3. 若使用 ICP_Localization 定位，需要提供 .pcd 点云图
+- Gazebo 能启动但机器人不动：检查 `robot_description`、`/cmd_vel` 和底盘插件是否存在。
+- Nav2 没有路径：检查定位是否发布 `map → odom`，目标是否落在地图可通行区域。
+- 点云没有进入代价地图：依次检查 `/livox/lidar/pointcloud`、地面分割输出、`/scan` 和 TF。
+- 行为树不巡逻：检查比赛阶段、裁判串口是否有有效帧，以及 `IsEcDecisionGoOut` 是否允许出家。
+- 目标追击抖动：适当增大 `smoothing_alpha` 的滤波时间常数、`update_distance_threshold` 或调整 `follow_distance`。
 
-5. `lio_rviz`:
-   - `True` - 可视化 FAST_LIO 或 Point_LIO 的点云图
+## 参考与致谢
 
-6. `nav_rviz`:
-   - `True` - 可视化 navigation2
+本项目使用并修改了 ROS 2 Navigation2、TEB Local Planner、FAST-LIO、Point-LIO、SLAM Toolbox、Livox ROS Driver 和 Livox Gazebo 仿真等开源项目。感谢开源社区提供的算法、驱动和场地模型，也感谢参与测试和交流的 RoboMaster 队伍。
 
-### 3.2 仿真模式示例
+## License
 
-- 边建图边导航
-
-    ```sh
-    ros2 launch rm_nav_bringup bringup_sim.launch.py \
-    world:=RMUL \
-    mode:=mapping \
-    lio:=pointlio \
-    lio_rviz:=False \
-    nav_rviz:=True
-    ```
-
-- 已知全局地图导航
-
-    ```sh
-    ros2 launch rm_nav_bringup bringup_sim.launch.py \
-    world:=RMUL \
-    mode:=nav \
-    lio:=pointlio \
-    localization:=slam_toolbox \
-    lio_rviz:=False \
-    nav_rviz:=True
-    ```
-
-### 3.3 真实模式示例
-
-
-- 边建图边导航
-
-    ```sh
-    ros2 launch rm_nav_bringup bringup_real.launch.py \
-    world:=YOUR_WORLD_NAME \
-    mode:=mapping  \
-    lio:=pointlio \
-    lio_rviz:=False \
-    nav_rviz:=True
-    
-    ros2 launch real_vel_transform real_vel_transform.launch.py
-    
-    ros2 topic pub -1 /goal_pose geometry_msgs/msg/PoseStamped \
-  "{ header: { frame_id: \"map\" }, pose: { position: { x: 2.0, y: -1.0, z: 0.0 }, orientation: { x: 0.0, y: 0.0, z: 0.0, w: 0.0 } } }"
-    Tips:
-
-    1. 保存点云 pcd 文件：需先在 [fastlio_mid360.yaml](src/rm_nav_bringup/config/reality/fastlio_mid360_real.yaml) 中 将 `pcd_save_en` 改为 `true`，并设置 .pcd 文件的路径，运行时新开终端输入命令 `ros2 service call /map_save std_srvs/srv/Trigger`，即可保存点云文件。
-    2. 保存地图：请参考 [如何保存 .pgm 和 .posegraph 地图？](https://gitee.com/SMBU-POLARBEAR/pb_rmsimulation/issues/I9427I)。地图名需要与 `YOUR_WORLD_NAME` 保持一致。
-
-- 已知全局地图导航
-
-    ```sh
-    ros2 launch rm_nav_bringup bringup_real.launch.py \
-    world:=YOUR_WORLD_NAME \
-    mode:=nav \
-    lio:=pointlio \
-    localization:=slam_toolbox \
-    lio_rviz:=False \
-    nav_rviz:=True
-    ```
-
-    Tips: 栅格地图文件和 pcd 文件需具为相同名称，分别存放在 `src/rm_nav_bringup/map` 和 `src/rm_nav_bringup/PCD` 中，启动导航时 world 指定为文件名前缀即可。
-
-### 3.4 小工具 - 键盘控制
-
-```sh
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-```
-
-## 四. 实车适配关键参数
-
-1. 雷达 ip
-
-    本导航包已内置 [livox_ros_driver2](https://gitee.com/SMBU-POLARBEAR/livox_ros_driver2_humble)，可直接修改 [MID360_config.json](./src/rm_nav_bringup/config/reality/MID360_config.json) - `lidar_configs` - `ip`
-
-2. 测量机器人底盘正中心到雷达的相对坐标
-
-    x, y 距离比较重要，将影响云台旋转时解算到 base_link 的坐标准确性
-
-    填入 [measurement_params_real.yaml](./src/rm_nav_bringup/config/reality/measurement_params_real.yaml)
-
-    若雷达倾斜放置，无需在此处填入 rpy，而是将点云旋转角度填入 [MID360_config.json](./src/rm_nav_bringup/config/reality/MID360_config.json) - `extrinsic_parameter`
-
-3. 测量雷达与地面的垂直距离
-
-    此参数影响点云分割效果
-
-    填入 [segmentation_real.yaml](./src/rm_nav_bringup/config/reality/segmentation_real.yaml) - `sensor_height`
-
-4. nav2_params
-
-    参数很多，比较重要的是 robot_radius 和 速度相关参数。详见 [nav2官方文档](https://docs.nav2.org/)
-
-## 后记
-
-> 这个仿真包也是我学习的一个记录，也是我学习的一个起点。
-
-很难想象一年前的五月，我连 Ubuntu 和 ROS 是都不知道。笔者大一时只是个混子，北极熊第一届视觉组成员（其实啥也没干），但误打误撞去了 2023 联盟赛广东站赛场。当时只是作为一个观众+摄影师，但赛场的氛围是无以言表的，回来后 RM 浓度就开始逐渐增高，尝试部署华师2023的视觉开源，也在这段时间逐渐学会了自学的方式，写下了第一篇 [算法组文档](https://flowus.cn/lihanchen/facb28a9-5d34-42a7-9bc8-630a182c3571) 。
-
-暑假时参加了“快递速达”的支线任务（比赛），那是第一次初识导航，还记得举着电脑拿着2D雷达在实验楼建图的喜悦。后来被春茧里华农的“自动驾驶”哨兵震撼到了，于是乎大二上和“实验楼安家组”出去喝粥路上，队长问我 24 赛季你想做啥，我毫不犹豫的答出了“导航”。
-
-抱着玩一玩练练手的心态创建了本仓库，第一个 [commit](https://gitee.com/SMBU-POLARBEAR/pb_rmsimulation/commit/a3e475ce59c60d68462e4555a76113e4ba1295f1) 在 2023-09-27，当时借鉴的还是 [华农 2023 RMUL 哨兵导航开源包](https://github.com/SCAU-RM-NAV/rm2023_auto_sentry_ws) 和 [湖工大RMUC地图](https://github.com/HBUTHUANGPX/Hbut_LC_sentry)，在此基础上只是加了 mid360 的仿真。后来 2023.10 月 中南大学 FYT 战队开源了[RM 哨兵上位机算法](https://github.com/baiyeweiguang/CSU-RM-Sentry)，是当时少见的 ROS2 nav2 导航框架，于是乎当时就想着缝进初代导航包（直到现在也是中南 FYT 的模样）。在不断尝试新算法的过程中，对 Gazebo 和 ros2_launch 也有了更深入的了解。
-
-如果没有开发这个仿真包，我可能也不会有机会接触到导航算法，也不会有机会接触到这么多优秀的开源项目。我还记得那是 2023.1.26，在港中深的哨兵上部署了我的仿真包（ RMUC 联队），改改 launch 文件居然就能让实车动起来了，意料之外地实现了 Sim2Real。由于学校没有机械专业，哨兵在联盟赛前不到两周才完全出生，于是乎备赛期间一直都是在赛博调车优化。
-
-上赛场了，从观众席到检录区。但当时由于在仿真中忽略了雷达偏心放置时的 tf 问题，导致实车云台旋转时定位不准，最终也没能在 RMUL 中发挥丝滑的导航走位...挺遗憾的。
-
-鄙人非大佬，只是个缝合怪菜鸡。我的学习路径个人觉得是有点畸形的，并不是自下而上地先学理论再实践，而是自上而下地先实践再不断补理论的坑。但这种学习方式也不断地给我正反馈，梦里都在改代码，每天醒来都有盼头。
-
-## 致谢（不分先后）
-
-Mid360 点云仿真：参考了 [livox_laser_simulation](https://github.com/Livox-SDK/livox_laser_simulation/blob/main/src/livox_points_plugin.cpp)、 [livox_laser_simulation_RO2](https://github.com/stm32f303ret6/livox_laser_simulation_RO2/blob/main/src/livox_points_plugin.cpp)、 [Issue15: CustomMsg](https://github.com/Livox-SDK/livox_laser_simulation/issues/15)。
-
-导航算法框架：基于 [中南大学 FYT 战队 RM 哨兵上位机算法](https://github.com/baiyeweiguang/CSU-RM-Sentry) 修改并适配仿真，在原有基础上添加对 base_link 的建模，提供多种可选定位方式并完善 launch 文件。
-
-感谢深技大 Shockley，对雷达跟随云台旋转时的速度变换问题提供了很好的解决思路，从而有了 [fake_vel_transform](./src/rm_navigation/fake_vel_transform/) 功能包。
-
-感谢上海工程技术大学、辽宁科技大学、上海电力大学对本开源包的深度使用与交流，给了我很多优化方向。
-
-还有很多很多很多 RM 网友给了我很多鼓励和帮助，这里就不一一列举了（已达成龙王结局，QQ 里 RM 分组九十多人）。
+仓库根目录的 [`LICENSE`](LICENSE) 文件包含本项目当前许可证信息；各第三方功能包仍应遵循其各自上游仓库的许可证。
