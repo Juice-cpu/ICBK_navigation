@@ -5,7 +5,7 @@
 ![Gazebo Classic](https://img.shields.io/badge/Gazebo-Classic%2011-FF8C00)
 ![C++ / Python](https://img.shields.io/badge/language-C%2B%2B%20%7C%20Python-3776AB)
 
-这是广州航海学院 RoboMaster 哨兵机器人的导航算法工作空间。项目以 ROS 2 Humble、Gazebo Classic 和 Navigation2 为基础，把激光雷达仿真、LIO 里程计、定位建图、全局规划、TEB 局部规划、代价地图和比赛决策行为树连接起来，覆盖从“传感器数据”到“底盘速度指令”的完整链路。
+这是广州航海学院 RoboMaster 2026 哨兵机器人的导航算法工作空间。项目以 ROS 2 Humble、Gazebo Classic 和 Navigation2 为基础，把激光雷达仿真、LIO 里程计、定位建图、全局规划、TEB 局部规划、代价地图和比赛决策行为树连接起来，覆盖从“传感器数据”到“底盘速度指令”的完整链路。
 
 仓库同时保留了仿真和实车入口。仿真中可以复现 RMUL/RMUC 场地、动态障碍物、巡逻、目标追击和低血量回家等行为；实车端只需替换传感器、地图和底盘通信参数即可沿用同一套 Nav2 接口。
 
@@ -18,6 +18,10 @@
 | RMUL 场地导航 | 动态避障 | 轨迹跟踪 |
 | :---: | :---: | :---: |
 | ![RMUL Gazebo](.docs/gazebo_RMUL.png) | ![动态避障](.docs/2024.5.11RMUL动态避障2.gif) | ![轨迹跟踪](.docs/2024.5.11RMUC轨迹跟踪一键偷家.gif) |
+
+赛场效果|
+|:-:|
+|[青春总有场不计得失的热爱 · 哔哩哔哩视频](https://www.bilibili.com/video/BV162Es6XEZa/)
 
 ## 系统总览
 
